@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  OPTIONAL auto-start for VM Panel. Not installed by default.
+  To install (starts the panel at login, restarts if it crashes):
+    cp launchd/com.vmpanel.plist ~/Library/LaunchAgents/com.vmpanel.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vmpanel.plist
+  To remove:
+    launchctl bootout gui/$(id -u)/com.vmpanel
+    rm ~/Library/LaunchAgents/com.vmpanel.plist
+  Note: this starts the panel, not the Colima VM. The panel shows a
+  degraded "VM stopped" state until you start the VM from its UI.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.vmpanel</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/mac/vm-panel/server.js</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/Users/mac/Library/Logs/vm-panel.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/mac/Library/Logs/vm-panel.log</string>
+</dict>
+</plist>

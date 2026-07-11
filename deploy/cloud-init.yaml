@@ -1,0 +1,136 @@
+# VM Panel — reference cloud-init for provisioning a fresh EC2 host (Ubuntu 24.04,
+# arm64 / Graviton r7g). Infrastructure-as-Code starting point: installs Docker +
+# Node 20, fetches the panel, and runs it under systemd (the Linux equivalent of
+# the macOS launchd agent). Adjust the repo source and backup target for your env.
+#
+#   Launch:  aws ec2 run-instances ... --user-data file://deploy/cloud-init.yaml
+#
+#cloud-config
+package_update: true
+packages:
+  - docker.io
+  - nodejs
+  - npm
+  - unzip
+  # Webcam for Media Desktops uses a virtual v4l2loopback camera. The dkms build
+  # needs kernel headers that MATCH the running kernel, so it is installed in
+  # runcmd (below) AFTER the correct linux-headers-* package — NOT here, where the
+  # postinst would build against missing headers and silently fail.
+
+write_files:
+  # Load the virtual-camera module at boot so /dev/video0 exists for Media
+  # Desktops. exclusive_caps=1 makes it look like a real capture device to apps
+  # (ffmpeg/Firefox); the panel auto-detects /dev/video0 and enables the webcam.
+  - path: /etc/modules-load.d/v4l2loopback.conf
+    content: |
+      v4l2loopback
+  - path: /etc/modprobe.d/v4l2loopback.conf
+    content: |
+      options v4l2loopback devices=1 video_nr=0 card_label=VMPanelCam exclusive_caps=1
+  # The device node is root:video 0660 by default; the KasmVNC container runs as
+  # uid 1000 (not in the host video group), so --device would map it but the
+  # desktop apps could not open it. Make video nodes world-accessible (0666) —
+  # this box only runs the panel's own containers.
+  - path: /etc/udev/rules.d/99-vmpanel-video.rules
+    content: |
+      KERNEL=="video[0-9]*", SUBSYSTEM=="video4linux", MODE="0666"
+
+  - path: /etc/systemd/system/vm-panel.service
+    content: |
+      [Unit]
+      Description=VM Panel
+      After=docker.service
+      Requires=docker.service
+      [Service]
+      ExecStart=/usr/bin/node /opt/vm-panel/server.js
+      Restart=on-failure
+      RestartSec=3
+      # Cloud is secure-by-default: the panel binds LOOPBACK only; the sole
+      # public listener is Caddy, which terminates TLS and reverse-proxies both
+      # origins. Nothing plaintext is reachable off-box.
+      Environment=PATH=/usr/local/bin:/usr/bin:/bin VMP_BIND=127.0.0.1
+      WorkingDirectory=/opt/vm-panel
+      User=vmpanel
+      [Install]
+      WantedBy=multi-user.target
+
+  # Caddy TLS front for the cloud host. Set PANEL_DOMAIN in the two site labels
+  # to your real hostname for automatic Let's Encrypt certs; leave the `:443` /
+  # `:5443` form for an internal-CA cert on an IP-only host. Mirrors the two-origin
+  # isolation (panel API vs machine screens) from deploy/Caddyfile.
+  - path: /etc/caddy/Caddyfile
+    content: |
+      {
+        email admin@example.com
+      }
+      # Panel API — replace :443 with your-domain.example for public ACME certs.
+      :443 {
+        tls internal
+        reverse_proxy 127.0.0.1:5050 { header_up Host 127.0.0.1:5050 }
+      }
+      # Machine screens (separate origin) — replace :5443 similarly.
+      :5443 {
+        tls internal
+        reverse_proxy 127.0.0.1:5051 { header_up Host 127.0.0.1:5051 }
+      }
+
+  # Tell the panel its public HTTPS origin so cookies are Secure and the
+  # CSRF/Origin + CSP guards accept the Caddy-fronted origin. Set publicHost to
+  # your real domain (must match the Caddyfile site label).
+  - path: /opt/vm-panel/data/config.json
+    content: |
+      {
+        "bind": "127.0.0.1",
+        "publicTls": true,
+        "publicHost": "CHANGE_ME_PUBLIC_HOST",
+        "panelHttpsPort": 443,
+        "machineHttpsPort": 5443
+      }
+
+  - path: /etc/systemd/system/vm-panel-backup.service
+    content: |
+      [Unit]
+      Description=VM Panel data backup
+      [Service]
+      Type=oneshot
+      Environment=VMP_DATA_DIR=/opt/vm-panel/data VMP_BACKUP_DIR=/mnt/backup
+      ExecStart=/bin/bash /opt/vm-panel/launchers/backup.sh
+
+  - path: /etc/systemd/system/vm-panel-backup.timer
+    content: |
+      [Unit]
+      Description=Daily VM Panel backup
+      [Timer]
+      OnCalendar=*-*-* 02:30:00
+      Persistent=true
+      [Install]
+      WantedBy=timers.target
+
+runcmd:
+  - useradd -r -m -s /usr/sbin/nologin vmpanel || true
+  - usermod -aG docker vmpanel || true
+  # Webcam: install kernel headers matching THIS kernel (aws/generic fallbacks),
+  # then the dkms module, so v4l2loopback actually compiles. Apply the 0666 udev
+  # rule and bring the device up now (also loads on every boot via modules-load.d).
+  - apt-get install -y "linux-headers-$(uname -r)" || apt-get install -y linux-headers-aws linux-headers-generic || true
+  - apt-get install -y v4l2loopback-dkms v4l2loopback-utils || true
+  - udevadm control --reload-rules || true
+  - modprobe v4l2loopback || true
+  - udevadm trigger --subsystem-match=video4linux || chmod 0666 /dev/video0 || true
+  # Install Caddy (official apt repo) — the ONLY public listener; the panel stays
+  # on loopback (VMP_BIND above). Edit /etc/caddy/Caddyfile + config.json's
+  # publicHost to your real domain BEFORE opening the security group.
+  - apt-get install -y debian-keyring debian-archive-keyring apt-transport-https curl || true
+  - 'curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg || true'
+  - 'curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt | tee /etc/apt/sources.list.d/caddy-stable.list || true'
+  - apt-get update && apt-get install -y caddy || true
+  # TODO: place the panel at /opt/vm-panel (git clone or unzip an artifact) BEFORE
+  # this runs so config.json above lands beside it, then:
+  - chown -R vmpanel:vmpanel /opt/vm-panel || true
+  - systemctl daemon-reload
+  - systemctl enable --now docker
+  - systemctl enable --now vm-panel.service || true
+  - systemctl enable --now vm-panel-backup.timer || true
+  - systemctl enable --now caddy || true
+  # Only ports 443 + 5443 (Caddy) should be open in the security group. The panel
+  # (5050/5051) is loopback-only and never directly reachable off-box.

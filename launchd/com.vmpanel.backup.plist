@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Daily automated backup of VM Panel data/ (see launchers/backup.sh).
+  Installed by install.sh. Set VMP_BACKUP_DIR to an OFF-HOST path (a mounted
+  volume, synced folder, or rclone remote mount) for real disaster recovery.
+  Runs at 02:30 local; also runs at load if the machine was asleep at the time.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.vmpanel.backup</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/mac/vm-panel/launchers/backup.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>2</integer>
+    <key>Minute</key><integer>30</integer>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>VMP_DATA_DIR</key><string>/Users/mac/vm-panel/data</string>
+    <key>VMP_BACKUP_DIR</key><string>/Users/mac/vm-panel-backups</string>
+    <key>VMP_BACKUP_KEEP</key><string>14</string>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/mac/Library/Logs/vm-panel-backup.log</string>
+  <key>StandardErrorPath</key><string>/Users/mac/Library/Logs/vm-panel-backup.log</string>
+</dict>
+</plist>

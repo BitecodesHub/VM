@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>PRISM Virtual Desktop</title>
+  <link rel="icon" id="favicon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%234f8cff'/%3E%3Crect x='7' y='9' width='18' height='12' rx='2' fill='%23fff'/%3E%3Crect x='13' y='22' width='6' height='2' rx='1' fill='%23fff'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <!-- LOADING -->
+  <section data-view="loading">
+    <div class="wrap">
+      <div class="skeleton-row">
+        <div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>
+      </div>
+      <p class="loading-note hidden" id="loading-note" role="status" aria-live="polite"></p>
+    </div>
+  </section>
+
+  <!-- SETUP -->
+  <section data-view="setup" class="auth-wrap hidden">
+    <form class="auth-card" id="setup-form" method="post" action="/api/setup" novalidate>
+      <div class="auth-brand"><span class="logo">▚</span> PRISM Virtual Desktop</div>
+      <h1 class="auth-title">Create your admin account</h1>
+      <p class="auth-sub">This is the first run. This account manages users and machines.</p>
+      <label for="setup-user">Username</label>
+      <input id="setup-user" name="username" class="text-input" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required />
+      <label for="setup-pass">Password</label>
+      <input id="setup-pass" name="password" class="text-input" type="password" autocomplete="new-password" required />
+      <div class="pw-strength" id="setup-strength" aria-live="polite"></div>
+      <label for="setup-confirm">Confirm password</label>
+      <input id="setup-confirm" name="confirm" class="text-input" type="password" autocomplete="new-password" required />
+      <div class="form-error" id="setup-error" role="alert" aria-live="assertive"></div>
+      <button class="btn primary block" type="submit">Create admin account</button>
+    </form>
+  </section>
+
+  <!-- LOGIN -->
+  <section data-view="login" class="auth-wrap hidden">
+    <form class="auth-card" id="login-form" method="post" action="/api/login" novalidate>
+      <div class="auth-brand"><span class="logo">▚</span> PRISM Virtual Desktop</div>
+      <h1 class="auth-title">Sign in</h1>
+      <div class="notice" id="login-notice" hidden></div>
+      <label for="login-user">Username</label>
+      <input id="login-user" name="username" class="text-input" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" required />
+      <label for="login-pass">Password</label>
+      <input id="login-pass" name="password" class="text-input" type="password" autocomplete="current-password" required />
+      <div class="form-error" id="login-error" role="alert" aria-live="assertive"></div>
+      <button class="btn primary block" type="submit">Sign in</button>
+    </form>
+  </section>
+
+  <!-- FORCED PASSWORD CHANGE -->
+  <section data-view="forced-change" class="auth-wrap hidden">
+    <form class="auth-card" id="forced-form" novalidate>
+      <div class="auth-brand"><span class="logo">▚</span> PRISM Virtual Desktop</div>
+      <h1 class="auth-title">Set a new password</h1>
+      <p class="auth-sub">You must choose a new password before continuing.</p>
+      <label for="forced-current">Current password</label>
+      <input id="forced-current" class="text-input" type="password" autocomplete="current-password" required />
+      <label for="forced-new">New password</label>
+      <input id="forced-new" class="text-input" type="password" autocomplete="new-password" required />
+      <div class="pw-strength" id="forced-strength" aria-live="polite"></div>
+      <label for="forced-confirm">Confirm new password</label>
+      <input id="forced-confirm" class="text-input" type="password" autocomplete="new-password" required />
+      <div class="form-error" id="forced-error" role="alert" aria-live="assertive"></div>
+      <button class="btn primary block" type="submit">Change password</button>
+      <button class="btn ghost block" type="button" id="forced-logout">Sign out instead</button>
+    </form>
+  </section>
+
+  <!-- APP -->
+  <section data-view="app" class="hidden">
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo" aria-hidden="true">▚</span>
+        <div class="brand-text">
+          <span class="brand-title">PRISM Virtual Desktop</span>
+          <span class="brand-sub">Your local machines &amp; desktops</span>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <span class="quota-chip hidden" id="quota-chip"></span>
+        <button class="icon-btn" id="help-btn" title="Help &amp; tips" aria-label="Help">?</button>
+        <button class="account-btn" id="account-btn" aria-haspopup="true" aria-expanded="false">
+          <span class="avatar" id="avatar">?</span>
+          <span class="account-name" id="account-name"></span>
+        </button>
+      </div>
+    </header>
+    <nav class="nav-tabs hidden" id="nav-tabs" aria-label="Sections"></nav>
+    <main class="wrap">
+      <div id="banner" class="banner hidden"></div>
+      <div id="view-root"></div>
+    </main>
+  </section>
+
+  <!-- Account menu -->
+  <div class="menu hidden" id="account-menu" role="menu">
+    <div class="menu-head" id="menu-head"></div>
+    <button class="menu-item" id="menu-change-pw" role="menuitem">Change password</button>
+    <div class="menu-divider"></div>
+    <button class="menu-item" id="menu-logout" role="menuitem">Log out</button>
+  </div>
+
+  <!-- Help popover -->
+  <div id="help" class="help-pop hidden">
+    <h3>What is this?</h3>
+    <p>PRISM Virtual Desktop manages small Linux machines running on this Mac. Each machine is an isolated environment you open right in your browser.</p>
+    <ul>
+      <li><b>Open UI</b> shows a machine’s live screen inside the panel.</li>
+      <li><b>Create a machine</b> spins up a fresh desktop or browser-testing node.</li>
+      <li>Browser-testing nodes ask for a VNC password — it is <b>secret</b> (copy button on each card).</li>
+    </ul>
+    <p class="help-foot" id="help-addr"></p>
+  </div>
+
+  <!-- Viewer overlay -->
+  <div id="viewer" class="overlay hidden" data-overlay>
+    <div class="overlay-panel">
+      <div class="overlay-head">
+        <span id="viewer-title" class="overlay-title"></span>
+        <span id="viewer-hint" class="pw-chip hidden"></span>
+        <span class="spacer"></span>
+        <label class="viewer-res"><span class="sr-only">Screen fit</span>
+          <select id="viewer-resize" class="select" aria-label="Screen fit">
+            <option value="scale">Fit to window</option>
+            <option value="off">Actual size</option>
+            <option value="remote">Resize desktop</option>
+          </select>
+        </label>
+        <a id="viewer-newtab" class="btn ghost" target="_blank" rel="noopener">Open in new tab ↗</a>
+        <button class="btn ghost" id="viewer-close">Close ✕</button>
+      </div>
+      <div id="viewer-tip" class="viewer-tip hidden"></div>
+      <iframe id="viewer-frame" class="viewer-frame" allow="clipboard-read; clipboard-write"></iframe>
+    </div>
+  </div>
+
+  <!-- Logs modal -->
+  <div id="logs" class="overlay hidden" data-overlay>
+    <div class="modal">
+      <div class="overlay-head">
+        <span id="logs-title" class="overlay-title"></span>
+        <span class="spacer"></span>
+        <select id="logs-tail" class="select">
+          <option value="100">last 100 lines</option>
+          <option value="500" selected>last 500 lines</option>
+          <option value="2000">last 2000 lines</option>
+        </select>
+        <button class="btn ghost" id="logs-refresh">Refresh</button>
+        <button class="btn ghost" id="logs-copy">Copy</button>
+        <button class="btn ghost" id="logs-close">Close ✕</button>
+      </div>
+      <pre id="logs-body" class="logs-body"></pre>
+    </div>
+  </div>
+
+  <!-- Confirm modal -->
+  <div id="confirm" class="overlay hidden" data-overlay>
+    <div class="modal small">
+      <div class="overlay-head"><span class="overlay-title" id="confirm-title">Confirm</span></div>
+      <div class="confirm-body">
+        <p id="confirm-msg"></p>
+        <label class="check-row hidden" id="confirm-check-row"><input type="checkbox" id="confirm-check" /> <span id="confirm-check-label"></span></label>
+        <input id="confirm-input" class="text-input hidden" type="text" autocomplete="off" spellcheck="false" />
+      </div>
+      <div class="confirm-actions">
+        <button class="btn ghost" id="confirm-cancel">Cancel</button>
+        <button class="btn danger" id="confirm-ok">Delete</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Change password modal -->
+  <div id="change-pw" class="overlay hidden" data-overlay>
+    <form class="modal small" id="change-pw-form" novalidate>
+      <div class="overlay-head"><span class="overlay-title">Change password</span><span class="spacer"></span><button class="btn ghost" type="button" id="change-pw-close">Close ✕</button></div>
+      <div class="confirm-body">
+        <label for="cpw-current">Current password</label>
+        <input id="cpw-current" class="text-input" type="password" autocomplete="current-password" required />
+        <label for="cpw-new">New password</label>
+        <input id="cpw-new" class="text-input" type="password" autocomplete="new-password" required />
+        <div class="pw-strength" id="cpw-strength" aria-live="polite"></div>
+        <label for="cpw-confirm">Confirm new password</label>
+        <input id="cpw-confirm" class="text-input" type="password" autocomplete="new-password" required />
+        <div class="form-error" id="cpw-error" role="alert" aria-live="assertive"></div>
+      </div>
+      <div class="confirm-actions">
+        <button class="btn ghost" type="button" id="cpw-cancel">Cancel</button>
+        <button class="btn primary" type="submit">Change password</button>
+      </div>
+    </form>
+  </div>
+
+  <!-- Credential reveal modal (create user / reset password) -->
+  <div id="credential" class="overlay hidden" data-overlay>
+    <div class="modal small">
+      <div class="overlay-head"><span class="overlay-title" id="credential-title">Account created</span></div>
+      <div class="confirm-body">
+        <p>Copy this password now — it is shown only once.</p>
+        <div class="credential-box" id="credential-box"></div>
+        <button class="btn" id="credential-copy">Copy username &amp; password</button>
+      </div>
+      <div class="confirm-actions">
+        <button class="btn primary" id="credential-done">Done, I copied it</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="toasts" class="toasts" role="status" aria-live="polite"></div>
+  <div id="toasts-assertive" class="sr-only" role="alert" aria-live="assertive"></div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

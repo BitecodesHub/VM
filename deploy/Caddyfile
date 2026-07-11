@@ -1,0 +1,43 @@
+# VM Panel — TLS front. Terminates HTTPS with Caddy's INTERNAL CA (LAN) and
+# proxies to the panel's plaintext loopback origins, preserving the two-origin
+# model that isolates machine screens from the panel API (P0-2):
+#
+#   https://<host>:8443  → panel API      (127.0.0.1:5050)
+#   https://<host>:5443  → machine screens (127.0.0.1:5051)
+#
+# HTTPS is required so browsers grant microphone/camera (getUserMedia) inside the
+# Media Desktop. Ports are >1024 so Caddy runs as a normal launchd agent (no root).
+#
+# One-time trust (so the cert is valid → secure context works):
+#   • On THIS Mac:      sudo caddy trust        (installs Caddy's root CA)
+#   • On other devices: import Caddy's root CA (see README) and trust it.
+#
+# The panel must know its public origins — set in data/config.json:
+#   { "publicTls": true, "publicHost": "macs-macbook-pro.local" }
+{
+	auto_https disable_redirects
+	# Never touch the system trust store automatically (would need sudo / block a
+	# launchd agent). Trust the root explicitly once: `sudo caddy trust`.
+	skip_install_trust
+	# Keep Caddy's state under the panel data dir (survives, easy to back up).
+	storage file_system /Users/mac/vm-panel/data/caddy
+}
+
+# --- Panel API (HTTPS) ------------------------------------------------------
+macs-macbook-pro.local:8443, localhost:8443 {
+	tls internal
+	# Rewrite Host to the loopback upstream so the panel's host guard accepts it.
+	# Origin is left UNTOUCHED so the panel's CSRF/Origin guard still applies
+	# (the panel is configured to accept its public HTTPS origin).
+	reverse_proxy 127.0.0.1:5050 {
+		header_up Host 127.0.0.1:5050
+	}
+}
+
+# --- Machine screens (HTTPS, separate origin) -------------------------------
+macs-macbook-pro.local:5443, localhost:5443 {
+	tls internal
+	reverse_proxy 127.0.0.1:5051 {
+		header_up Host 127.0.0.1:5051
+	}
+}

@@ -1,0 +1,24 @@
+name: CI
+
+# Runs the zero-dependency test suite on every push and PR. The panel has no
+# npm dependencies, so this is just Node + `node --test` — fast and hermetic.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Run tests
+        run: node --test test/*.test.js
+      - name: Shell lint (launchers)
+        run: |
+          for f in launchers/*.sh install.sh; do
+            bash -n "$f" && echo "ok: $f"
+          done

@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TLS front for VM Panel (see deploy/Caddyfile). Terminates HTTPS on 8443 (panel)
+  and 5443 (machine screens) and proxies to the plaintext loopback origins.
+  HTTPS is required for microphone/camera in the Media Desktop.
+
+  Install (via install.sh) or manually:
+    cp launchd/com.vmpanel.caddy.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vmpanel.caddy.plist
+  Trust the internal CA once so the cert is valid (secure context):
+    sudo /opt/homebrew/bin/caddy trust
+  On OTHER devices, import Caddy's root CA (see README).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.vmpanel.caddy</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/caddy</string>
+    <string>run</string>
+    <string>--config</string>
+    <string>/Users/mac/vm-panel/deploy/Caddyfile</string>
+    <string>--adapter</string>
+    <string>caddyfile</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>/Users/mac</string>
+    <key>XDG_DATA_HOME</key><string>/Users/mac/vm-panel/data/caddy</string>
+  </dict>
+  <key>StandardOutPath</key><string>/Users/mac/Library/Logs/vm-panel-caddy.log</string>
+  <key>StandardErrorPath</key><string>/Users/mac/Library/Logs/vm-panel-caddy.log</string>
+</dict>
+</plist>

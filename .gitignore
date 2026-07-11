@@ -1,0 +1,16 @@
+# Runtime state & SECRETS — never commit. `data/` holds the HMAC signing key,
+# password hashes, sessions, the audit log, and Caddy's private CA key.
+data/
+*.log
+
+# Backups may contain the secret + hashes
+vm-panel-backups/
+*.tar.gz
+
+# OS / editor / agent
+.DS_Store
+.claude/
+*.swp
+
+# Node (this project is zero-dependency, but just in case)
+node_modules/

@@ -1,0 +1,14 @@
+{
+  "name": "vm-panel",
+  "version": "1.0.0",
+  "description": "Local admin panel for the Colima VM and its Docker containers",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
