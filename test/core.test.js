@@ -101,18 +101,18 @@ test('buildUiUrl is panel-relative and injects the noVNC ws path', () => {
   );
 });
 
-test('mapContainerToCard: managed linux-desktop with owner', () => {
+test('mapContainerToCard: managed linux-desktop with owner (KasmVNC media, no URL password)', () => {
   const insp = {
     Name: '/desktop-2',
     Config: {
-      Image: 'minimal-linux-desktop:latest',
+      Image: 'minimal-linux-desktop:xfce',
       Labels: {
         'vmpanel.managed': '1', 'vmpanel.template': 'linux-desktop', 'vmpanel.owner': 'alice',
-        'vmpanel.ui.port': '6081', 'vmpanel.ui.path': '/vnc.html?autoconnect=true&resize=scale',
+        'vmpanel.ui.port': '6201', 'vmpanel.webcam': '1',
       },
     },
     State: { Status: 'running', StartedAt: '2026-07-09T00:00:00Z' },
-    HostConfig: { PortBindings: { '6080/tcp': [{ HostIp: '127.0.0.1', HostPort: '6081' }] } },
+    HostConfig: { PortBindings: { '6901/tcp': [{ HostIp: '127.0.0.1', HostPort: '6201' }] } },
   };
   const c = mapContainerToCard(insp);
   assert.equal(c.name, 'desktop-2');
@@ -120,9 +120,11 @@ test('mapContainerToCard: managed linux-desktop with owner', () => {
   assert.equal(c.managed, true);
   assert.equal(c.embeddable, true);
   assert.equal(c.localOnly, false);
-  assert.equal(c.uiPort, 6081);
+  assert.equal(c.uiPort, 6201);
+  assert.equal(c.media, true);
+  assert.equal(c.camera, true, 'webcam label → camera available');
   assert.ok(c.uiUrl.startsWith('/m/desktop-2/vnc.html?'));
-  assert.ok(c.uiUrl.includes('password=secret'));
+  assert.ok(!c.uiUrl.includes('password='), 'KasmVNC uses injected Basic auth — no VNC password in URL');
   assert.ok(c.uiUrl.includes('path=m%2Fdesktop-2%2Fwebsockify'));
 });
 
@@ -172,51 +174,55 @@ test('templates: selenium nodes declare wdBrowserName for live sessions', () => 
   assert.equal(TEMPLATES['linux-desktop'].wdBrowserName, undefined, 'desktops have no webdriver');
 });
 
-test('mapContainerToCard: adopted linux-desktop has null owner, proxied url', () => {
+test('mapContainerToCard: adopted xfce desktop → linux-desktop, media, proxied url', () => {
   const insp = {
     Name: '/linux-desktop',
-    Config: { Image: 'minimal-linux-desktop:latest', Labels: {} },
+    Config: { Image: 'minimal-linux-desktop:xfce', Labels: {} },
     State: { Status: 'running' },
-    HostConfig: { PortBindings: { '6080/tcp': [{ HostIp: '127.0.0.1', HostPort: '6080' }] } },
+    HostConfig: { PortBindings: { '6901/tcp': [{ HostIp: '127.0.0.1', HostPort: '6201' }] } },
   };
   const c = mapContainerToCard(insp);
   assert.equal(c.adopted, true);
+  assert.equal(c.template, 'linux-desktop');
   assert.equal(c.owner, null);
   assert.equal(c.embeddable, true);
+  assert.equal(c.media, true);
   assert.ok(c.uiUrl.startsWith('/m/linux-desktop/'));
 });
 
-test('mapContainerToCard: managed media-desktop is media, proxied, camera from webcam label', () => {
+test('mapContainerToCard: managed icewm-desktop is media, camera from webcam label, no URL password', () => {
   const mk = (webcam) => mapContainerToCard({
-    Name: '/media-1',
-    Config: { Image: 'minimal-media-desktop:xfce', Labels: {
-      'vmpanel.managed': '1', 'vmpanel.template': 'media-desktop', 'vmpanel.owner': 'alice',
-      'vmpanel.ui.port': '6201', 'vmpanel.webcam': webcam,
+    Name: '/desktop-1',
+    Config: { Image: 'minimal-linux-desktop:icewm', Labels: {
+      'vmpanel.managed': '1', 'vmpanel.template': 'icewm-desktop', 'vmpanel.owner': 'alice',
+      'vmpanel.ui.port': '6202', 'vmpanel.webcam': webcam,
     } },
     State: { Status: 'running' },
-    HostConfig: { PortBindings: { '6901/tcp': [{ HostIp: '127.0.0.1', HostPort: '6201' }] } },
+    HostConfig: { PortBindings: { '6901/tcp': [{ HostIp: '127.0.0.1', HostPort: '6202' }] } },
   });
   const cam = mk('1');
+  assert.equal(cam.template, 'icewm-desktop');
   assert.equal(cam.media, true);
   assert.equal(cam.camera, true);
   assert.equal(cam.embeddable, true);
-  assert.ok(cam.uiUrl.startsWith('/m/media-1/vnc.html'));
-  assert.ok(cam.uiUrl.includes('path=m%2Fmedia-1%2Fwebsockify'));
+  assert.ok(cam.uiUrl.startsWith('/m/desktop-1/vnc.html'));
+  assert.ok(cam.uiUrl.includes('path=m%2Fdesktop-1%2Fwebsockify'));
   assert.ok(!cam.uiUrl.includes('password='), 'media auth is Basic (no VNC password in URL)');
   assert.equal(mk('0').camera, false, 'webcam=0 → camera unavailable');
 });
 
-test('mapContainerToCard: adopted media-desktop is recognised as media', () => {
+test('mapContainerToCard: adopted :icewm image → icewm-desktop, media', () => {
   const c = mapContainerToCard({
-    Name: '/media-adopted',
-    Config: { Image: 'minimal-media-desktop:latest', Labels: {} },
+    Name: '/icewm-adopted',
+    Config: { Image: 'minimal-linux-desktop:icewm', Labels: {} },
     State: { Status: 'running' },
     HostConfig: { PortBindings: { '6901/tcp': [{ HostIp: '127.0.0.1', HostPort: '6250' }] } },
   });
   assert.equal(c.adopted, true);
+  assert.equal(c.template, 'icewm-desktop');
   assert.equal(c.media, true);
   assert.equal(c.camera, null, 'no webcam label on an adopted container → unknown');
-  assert.ok(c.uiUrl.startsWith('/m/media-adopted/'));
+  assert.ok(c.uiUrl.startsWith('/m/icewm-adopted/'));
 });
 
 test('mapContainerToCard: portainer is protected, local-only, not embeddable', () => {
@@ -260,13 +266,12 @@ test('buildRunArgs omits webdriver for linux-desktop', () => {
     template: 'linux-desktop', name: 'desktop-1', owner: 'alice', ports: { ui: 6081 }, createdAt: 'x',
   });
   assert.ok(!args.some((a) => a.includes('webdriver')));
-  assert.ok(args.includes('127.0.0.1:6081:6080'));
+  assert.ok(args.includes('127.0.0.1:6081:6901'), 'KasmVNC desktops publish container port 6901');
 });
 
 test('isPanelMachine: only managed panel-template machines count (incl. icewm)', () => {
   assert.equal(isPanelMachine({ managed: true, template: 'linux-desktop' }), true);
   assert.equal(isPanelMachine({ managed: true, template: 'icewm-desktop' }), true);
-  assert.equal(isPanelMachine({ managed: true, template: 'media-desktop' }), true);
   assert.equal(isPanelMachine({ managed: true, template: 'chrome-node' }), true);
   assert.equal(isPanelMachine({ managed: true, template: 'firefox-node' }), true);
   assert.equal(isPanelMachine({ managed: false, template: 'linux-desktop' }), false); // adopted
@@ -313,57 +318,56 @@ test('quotaExceeded counts running + pending against the limit', () => {
   assert.equal(quotaExceeded([{ owner: 'alice', state: 'exited' }], 'alice', 0), false);
 });
 
-test('template registry: 5 templates, correct images/prefixes/memory', () => {
+test('template registry: 4 templates, correct images/prefixes/memory', () => {
   const ids = Object.keys(TEMPLATES).sort();
-  assert.deepEqual(ids, ['chrome-node', 'firefox-node', 'icewm-desktop', 'linux-desktop', 'media-desktop']);
+  assert.deepEqual(ids, ['chrome-node', 'firefox-node', 'icewm-desktop', 'linux-desktop']);
   assert.equal(TEMPLATES['linux-desktop'].image, 'minimal-linux-desktop:xfce');
   assert.equal(TEMPLATES['icewm-desktop'].image, 'minimal-linux-desktop:icewm');
   assert.equal(TEMPLATES['linux-desktop'].namePrefix, 'desktop');
   assert.equal(TEMPLATES['icewm-desktop'].namePrefix, 'desktop'); // shared prefix
-  assert.equal(TEMPLATES['linux-desktop'].memory, '1536m');
-  assert.equal(TEMPLATES['icewm-desktop'].memory, '1024m');
+  assert.equal(TEMPLATES['linux-desktop'].memory, '2048m');
+  assert.equal(TEMPLATES['icewm-desktop'].memory, '1536m');
   assert.equal(TEMPLATES['chrome-node'].memory, '2048m');
   const lt = listTemplates();
-  assert.equal(lt.length, 5);
-  assert.ok(lt.find((t) => t.id === 'linux-desktop').hint === 'Recommended');
+  assert.equal(lt.length, 4);
+  assert.ok(lt.find((t) => t.id === 'linux-desktop').hint.includes('Recommended'));
+  assert.equal(lt.find((t) => t.id === 'linux-desktop').media, true, 'listTemplates surfaces the media flag');
 });
 
-test('media-desktop template: KasmVNC image, TLS + Basic-auth backend, VNC_PW env, webcam', () => {
-  const m = TEMPLATES['media-desktop'];
-  assert.equal(m.image, 'minimal-media-desktop:xfce');
-  assert.equal(m.namePrefix, 'media');
-  assert.equal(m.media, true);
-  assert.equal(m.needsWebcam, true);
-  assert.equal(m.backendTls, true);
-  assert.deepEqual(m.backendAuth, { user: 'kasm_user', pass: 'secret' });
-  assert.deepEqual(m.env, [{ name: 'VNC_PW', value: 'secret' }]);
-  // Auth is the injected Basic auth; NO VNC password appended to the URL.
-  assert.equal(m.ui.password.mode, 'none');
-  assert.equal(m.ports.find((p) => p.role === 'ui').containerPort, 6901);
-  // listTemplates surfaces it with its mic/cam hint.
-  assert.ok(listTemplates().find((t) => t.id === 'media-desktop'));
+test('desktop templates: BOTH are KasmVNC media (TLS + Basic-auth, VNC_PW, webcam, no URL password)', () => {
+  for (const id of ['linux-desktop', 'icewm-desktop']) {
+    const m = TEMPLATES[id];
+    assert.equal(m.media, true, `${id} is media`);
+    assert.equal(m.needsWebcam, true, `${id} maps webcam`);
+    assert.equal(m.backendTls, true, `${id} speaks HTTPS to the backend`);
+    assert.deepEqual(m.backendAuth, { user: 'kasm_user', pass: 'secret' });
+    assert.deepEqual(m.env, [{ name: 'VNC_PW', value: 'secret' }]);
+    assert.equal(m.ui.password.mode, 'none', `${id}: Basic auth, no VNC password in URL`);
+    assert.equal(m.ports.find((p) => p.role === 'ui').containerPort, 6901);
+  }
+  assert.equal(TEMPLATES['linux-desktop'].image, 'minimal-linux-desktop:xfce');
+  assert.equal(TEMPLATES['icewm-desktop'].image, 'minimal-linux-desktop:icewm');
 });
 
-test('buildRunArgs media-desktop: emits VNC_PW; webcam device only when host has one', () => {
-  const base = { template: 'media-desktop', name: 'media-1', owner: 'alice', ports: { ui: 6201 }, createdAt: 'x' };
-  // No host webcam (this Mac): env present, device absent, label records 0.
+test('buildRunArgs desktop: emits VNC_PW; webcam device only when host has one', () => {
+  const base = { template: 'linux-desktop', name: 'desktop-1', owner: 'alice', ports: { ui: 6201 }, createdAt: 'x' };
+  // No host webcam: env present, device absent, label records 0.
   const noCam = buildRunArgs(base);
   assert.equal(noCam[noCam.indexOf('-e') + 1], 'VNC_PW=secret');
   assert.ok(!noCam.includes('--device'), 'no device mapped without a host camera');
   assert.ok(noCam.includes('vmpanel.webcam=0'));
   assert.ok(noCam.includes('127.0.0.1:6201:6901'), 'loopback-bound KasmVNC port');
-  assert.equal(noCam[noCam.length - 1], 'minimal-media-desktop:xfce');
+  assert.equal(noCam[noCam.length - 1], 'minimal-linux-desktop:xfce');
   // Host webcam present: device mapped, label records 1.
   const withCam = buildRunArgs({ ...base, hostWebcam: true });
   assert.equal(withCam[withCam.indexOf('--device') + 1], '/dev/video0:/dev/video0');
   assert.ok(withCam.includes('vmpanel.webcam=1'));
-  // Shared by default (no caps) even for media.
-  assert.ok(!withCam.includes('--memory'));
+  assert.ok(!withCam.includes('--memory'), 'shared by default (no caps)');
 });
 
-test('buildRunArgs: non-media templates emit no VNC_PW env or webcam label', () => {
-  const d = buildRunArgs({ template: 'linux-desktop', name: 'd1', owner: 'alice', ports: { ui: 6081 }, createdAt: 'x' });
-  assert.ok(!d.some((a) => String(a).startsWith('VNC_PW=')), 'no VNC_PW for VNC desktops');
+test('buildRunArgs: Selenium nodes (non-media) emit no VNC_PW env or webcam label', () => {
+  const d = buildRunArgs({ template: 'chrome-node', name: 'c1', owner: 'alice', ports: { ui: 7901, webdriver: 4445 }, createdAt: 'x' });
+  assert.ok(!d.some((a) => String(a).startsWith('VNC_PW=')), 'no VNC_PW for Selenium nodes');
   assert.ok(!d.some((a) => String(a).startsWith('vmpanel.webcam=')), 'no webcam label for non-media');
 });
 
@@ -376,12 +380,12 @@ test('buildRunArgs: resources shared by default (no caps), capped label 0', () =
 
 test('buildRunArgs: cap=true applies per-template memory + cpu caps, capped label 1', () => {
   const desk = buildRunArgs({ template: 'linux-desktop', name: 'desktop-1', owner: 'alice', ports: { ui: 6081 }, createdAt: 'x', cap: true });
-  assert.equal(desk[desk.indexOf('--memory') + 1], '1536m');
-  assert.equal(desk[desk.indexOf('--memory-swap') + 1], '1536m');
+  assert.equal(desk[desk.indexOf('--memory') + 1], '2048m');
+  assert.equal(desk[desk.indexOf('--memory-swap') + 1], '2048m');
   assert.equal(desk[desk.indexOf('--cpus') + 1], '2');
   assert.ok(desk.includes('vmpanel.capped=1'), 'labelled capped');
   const ice = buildRunArgs({ template: 'icewm-desktop', name: 'desktop-2', owner: 'alice', ports: { ui: 6082 }, createdAt: 'x', cap: true });
-  assert.equal(ice[ice.indexOf('--memory') + 1], '1024m');
+  assert.equal(ice[ice.indexOf('--memory') + 1], '1536m');
   const chr = buildRunArgs({ template: 'chrome-node', name: 'chrome-node-1', owner: 'alice', ports: { ui: 7901, webdriver: 4445 }, createdAt: 'x', cap: true });
   assert.equal(chr[chr.indexOf('--memory') + 1], '2048m');
 });

@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import http from 'node:http';
+import https from 'node:https';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -100,12 +101,63 @@ test('guards: content-type, origin, host', async () => {
 });
 
 // ---- Proxy (real backend + WS) ---------------------------------------------
+// Desktops are KasmVNC (backendTls:true) now, so the fake backend serves HTTPS
+// with a throwaway self-signed cert — exercising the panel's REAL production
+// path (TLS + injected Basic auth relay). The panel connects rejectUnauthorized:false.
+const TEST_BACKEND_CERT = `-----BEGIN CERTIFICATE-----
+MIIDJTCCAg2gAwIBAgIUHYqKOfqtCLPF9c+xgp6lhBMSaDAwDQYJKoZIhvcNAQEL
+BQAwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDcxMjE2NDA1MFoXDTM2MDcw
+OTE2NDA1MFowFDESMBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEF
+AAOCAQ8AMIIBCgKCAQEA4ZPunmlKytO/1iJg2Ajq8J/DYgGH6NvDpFh+wfZXGhtr
+SSZHvbdm+aCecBzfZfsV58PdD/xiJYuXbEXY02M8aWTMg3jR1baX1oKwyFLVGo7e
+Q/8U08KK/UkDcoQXhUEabnWUqORie+sf03TdNRxI1+h6Vwk9ebeV+74yrm7MSX4O
+XeVpBTD6snogohXmpqKIEzlqh99jfr898kpD6+/8kw1ywVu5q6D6oOzWHEl5b0yy
+48/NNn1QRNXRmPOi834Dvo3yGtzKRcmiHMaB/JSHit3eFdVYP5UwVzmLSsVYBUMU
+W/cAFu7LNovIkDbFVR+RaheaSTpXOYyHMsbDu8utlwIDAQABo28wbTAdBgNVHQ4E
+FgQU24KVTZEVydygSkix8603RcNPih8wHwYDVR0jBBgwFoAU24KVTZEVydygSkix
+8603RcNPih8wDwYDVR0TAQH/BAUwAwEB/zAaBgNVHREEEzARgglsb2NhbGhvc3SH
+BH8AAAEwDQYJKoZIhvcNAQELBQADggEBAD+UCCrrYXMqmahBvmclVfBYBl21ZHAo
+BsVn9BLZlRYsLWv+Ib/7doFAkj5j61R+wJj+2ppeZSjPXP9Y6rfJJ30DPhU1Wf0w
+hSnRUWtKdfPDEp6Uxw+YT6K5+M/lLWoKpOgP9j4s+IdhRapY8J1BlH8glGqNoP2F
+XajOnVUmJAgWtbU3sk+rdoNo9dyJKaj07B+DbEkZ15Mmbg85Snm/79Vhh9DstfPH
+3ChiPDKrMGkb9YW1FkjXTwbk5cbDZdmjdAJrQjjPG26RUNdvHF7IJIKFl3IZS3Jj
+ywS5TIjSUkVhYNyO8gwOMl1/iCfk1o8fD2UoWLeVkRgMpFZYe+7DKj4=
+-----END CERTIFICATE-----`;
+const TEST_BACKEND_KEY = `-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDhk+6eaUrK07/W
+ImDYCOrwn8NiAYfo28OkWH7B9lcaG2tJJke9t2b5oJ5wHN9l+xXnw90P/GIli5ds
+RdjTYzxpZMyDeNHVtpfWgrDIUtUajt5D/xTTwor9SQNyhBeFQRpudZSo5GJ76x/T
+dN01HEjX6HpXCT15t5X7vjKubsxJfg5d5WkFMPqyeiCiFeamoogTOWqH32N+vz3y
+SkPr7/yTDXLBW7mroPqg7NYcSXlvTLLjz802fVBE1dGY86LzfgO+jfIa3MpFyaIc
+xoH8lIeK3d4V1Vg/lTBXOYtKxVgFQxRb9wAW7ss2i8iQNsVVH5FqF5pJOlc5jIcy
+xsO7y62XAgMBAAECggEAYH4pOnYL2ktN6kl2Z7MY3KlaqJfDDWbEf46jWlEH3VER
+SY8obQ0A7ZM5cvfG0BbhvexYqbfqO+lEcrpGD9aJRwQpP6v1Bpg+xzHMcUSNh/jJ
+NwjsXdEAJ2yOHvRGI2g/6DQ/zSc0wZFIYenBnjBlMIZvnr+DHofbjn5Dq74VgPGv
+hmb2+mhWLd4vGUON3xNNzitl79ax8vIh9X8HJXiJ+1GCZ5vPCBW5mNZmrBKQQKWm
+ic377IPRHfckeMAfT4qaUiZD87p9qkXCelPUcAsy2/GtxjnwXC2Tl8394GL52zld
+tHDAb8/7QEb04HQRkZ9qovpyL6qGPqcU8sDJoarksQKBgQD2rBq1mXdRoHL8RC64
+0H17OmqkUE8ye9prvW5WwntrA8pvDHBA4CkgOptEgLq9+Hovq5XHckpad85c4LBj
+xW2couYVilzrQQPwFL9LtXMuMK+ttElcyZZrUaD6kfsKS+i4E3LGJ0lJl3NpbdWz
+MHx/BczKgaAXhLfZItESGdnbDQKBgQDqG5/g5xoIIVkCOBLDhMnHfJ7i5dQBgtjx
+CemZlVv0T9ZP+7nArllkd4XcnJZYX5eMC8AK94pMvMECbXMmyG2jrmqIHSlFYPjK
+OtD2W0vpwGov8Y6yvASnDpqKat7GWlW7OAnjnhPmUwHlnTYKscTEBPJZxyhgYymS
+jxg6Ce6yMwKBgBCDFsqfOkiBiBDw83u1oSC1mVvkcFi9x7I8nP07yY0xVMS4PW9q
+UfZxVeFxCI8c6fj08HLIaMfDi1HWTJhxJ9Q7Z1F70JqC4KOaj++edtZZtfjXv61x
+ZRtL/I2pZfebezmPO7id+p7tf3FIQ+zZywuptLq9kJziangjh4FBr76lAoGAERtl
+qnSYxWFSdMQOMvVgHVCw95mdzWJ3Yd28kTmF16uB2KRnZXoYFCxbvsw+fES3+Ube
+iK6gD413eSrwUDQzNtPG+x1OZ8B3TafQnz/6oyEpYUmAiPUOTfrWNikrEEmHnD+z
+EUv63kjQiavcSBnHbB+EaiUQgUKdxhToy0zwgVsCgYEAppI20BguCRM89xATh1eb
+vZspnJpE9mO0I18942n7q9RparoQZF7Zwk0ZIO+tL3kZ/aCn7wp7ZcZ9p2OXr/cc
+QSff5z8iWrt3wRu1vINCL9DAMoE11NHZYGRsaTmjAVfhxagiArCvBb58hVlqUUf9
+GKFVlQfEB9M5pjr8A0K+0ac=
+-----END PRIVATE KEY-----`;
+
 function wsAccept(key) {
   return crypto.createHash('sha1').update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest('base64');
 }
 function startBackend() {
   const state = { lastHeaders: null };
-  const srv = http.createServer((req, res) => { state.lastHeaders = req.headers; res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>backend</html>'); });
+  const srv = https.createServer({ cert: TEST_BACKEND_CERT, key: TEST_BACKEND_KEY }, (req, res) => { state.lastHeaders = req.headers; res.writeHead(200, { 'Content-Type': 'text/html' }); res.end('<html>backend</html>'); });
   srv.on('upgrade', (req, socket) => {
     state.upgradeHeaders = req.headers;
     const accept = wsAccept(req.headers['sec-websocket-key']);
@@ -115,21 +167,19 @@ function startBackend() {
   return new Promise((resolve) => srv.listen(0, '127.0.0.1', () => resolve({ port: srv.address().port, state, close: () => srv.close() })));
 }
 
-function seedMachine(owner, uiPort, state = 'running') {
-  return { nextId: 2, containers: { 'desktop-1': {
-    id: 'fake000000001', image: 'minimal-linux-desktop:xfce',
-    labels: { 'vmpanel.managed': '1', 'vmpanel.template': 'linux-desktop', 'vmpanel.owner': owner, 'vmpanel.ui.port': String(uiPort), 'vmpanel.ui.path': '/vnc.html?autoconnect=true&resize=scale' },
-    ports: { '6080': String(uiPort) }, state, exitCode: 0, startedAt: '2026-07-10T00:00:00Z',
+// A seeded KasmVNC desktop (both templates are media now). `webcam` sets the
+// camera label; template defaults to linux-desktop (XFCE).
+function seedMachine(owner, uiPort, state = 'running', { name = 'desktop-1', template = 'linux-desktop', image = 'minimal-linux-desktop:xfce', webcam = null } = {}) {
+  const labels = { 'vmpanel.managed': '1', 'vmpanel.template': template, 'vmpanel.owner': owner, 'vmpanel.ui.port': String(uiPort) };
+  if (webcam !== null) labels['vmpanel.webcam'] = webcam;
+  return { nextId: 2, containers: { [name]: {
+    id: 'fake000000001', image, labels,
+    ports: { '6901': String(uiPort) }, state, exitCode: 0, startedAt: '2026-07-10T00:00:00Z',
   } } };
 }
 
 function seedMediaMachine(owner, uiPort, webcam = '0') {
-  return { nextId: 2, containers: { 'media-1': {
-    id: 'fake000000002', image: 'minimal-media-desktop:xfce',
-    labels: { 'vmpanel.managed': '1', 'vmpanel.template': 'media-desktop', 'vmpanel.owner': owner, 'vmpanel.ui.port': String(uiPort),
-      'vmpanel.ui.path': '/vnc.html?autoconnect=true&resize=scale&reconnect=true&reconnect_delay=2000', 'vmpanel.webcam': webcam },
-    ports: { '6901': String(uiPort) }, state: 'running', exitCode: 0, startedAt: '2026-07-10T00:00:00Z',
-  } } };
+  return seedMachine(owner, uiPort, 'running', { name: 'media-1', webcam });
 }
 
 test('media: stale hostWebcam degrades to audio-only (create succeeds, no 500)', async () => {
@@ -137,12 +187,12 @@ test('media: stale hostWebcam degrades to audio-only (create succeeds, no 500)',
   // fails with a device error. The panel must retry without --device, not 500.
   await withPanel({ config: { hostWebcam: true }, env: { FAKE_DOCKER_NO_VIDEO: '1' } }, async (panel) => {
     const admin = await setupAdmin(panel);
-    const r = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'media-desktop' } });
+    const r = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop' } });
     assert.equal(r.status, 202, 'media create succeeds (degraded to audio-only), not a 500');
     // The created container carries no --device, so its webcam label is 0.
     const w = panel.readWorld();
-    const media = Object.values(w.containers).find((c) => c.labels['vmpanel.template'] === 'media-desktop');
-    assert.ok(media, 'a media container was created');
+    const media = Object.values(w.containers).find((c) => c.labels['vmpanel.template'] === 'linux-desktop');
+    assert.ok(media, 'a desktop container was created');
     assert.equal(media.labels['vmpanel.webcam'], '0', 'created without the camera device (audio/mic still work)');
   });
 });

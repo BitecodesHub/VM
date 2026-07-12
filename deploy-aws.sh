@@ -42,9 +42,15 @@ apt-get install -y "linux-headers-$(uname -r)" v4l2loopback-dkms v4l2loopback-ut
   modprobe v4l2loopback devices=1 video_nr=0 card_label=VMPanelCam exclusive_caps=1 2>/dev/null && \
   chmod 0666 /dev/video0 2>/dev/null || echo "  (webcam unavailable — audio/mic still work)"
 
-echo "[4/7] Building desktop images (this is the slow part)…"
-docker build -t minimal-linux-desktop:xfce "$APP_DIR/images/linux-desktop" || echo "  WARN: linux-desktop build failed"
-docker build -t minimal-media-desktop:xfce "$APP_DIR/images/media-desktop" || echo "  WARN: media-desktop build failed"
+echo "[4/7] Building/provisioning ALL template images (the slow part)…"
+# Both desktops are KasmVNC-based (audio/mic/camera by default).
+docker build -t minimal-linux-desktop:xfce   "$APP_DIR/images/linux-desktop"  || echo "  WARN: xfce desktop build failed"
+docker build -t minimal-linux-desktop:icewm  "$APP_DIR/images/icewm-desktop"  || echo "  WARN: icewm desktop build failed"
+# Selenium node images: pull the public multi-arch seleniarm images and retag to
+# the local names the templates reference, so Chrome/Firefox nodes never try to
+# pull a non-existent repo (that was the "VM not creating" 500).
+docker pull seleniarm/standalone-chromium:latest && docker tag seleniarm/standalone-chromium:latest local-seleniarm/standalone-chromium:4.5.0-20260701 || echo "  WARN: chromium node image unavailable"
+docker pull seleniarm/standalone-firefox:latest  && docker tag seleniarm/standalone-firefox:latest  local-seleniarm/standalone-firefox:4.5.0-20260701  || echo "  WARN: firefox node image unavailable"
 
 echo "[5/7] Panel runtime config…"
 mkdir -p "$APP_DIR/data"

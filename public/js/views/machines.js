@@ -18,19 +18,18 @@ function bootElapsed(name, running, ready) {
 
 // Fallback tile list until /api/templates loads (store.templates is authoritative).
 const FALLBACK_TEMPLATES = [
-  { id: 'linux-desktop', label: 'Linux Desktop — Modern (XFCE)', description: 'Full Ubuntu desktop (XFCE)', hint: 'Recommended' },
-  { id: 'icewm-desktop', label: 'Linux Desktop — Lightweight (IceWM)', description: 'Smaller, snappier desktop', hint: 'Lightweight' },
-  { id: 'media-desktop', label: 'Linux Desktop — Media (audio + camera)', description: 'Speaker, microphone and webcam work in this desktop', hint: 'Mic · Speaker · Camera' },
+  { id: 'linux-desktop', label: 'Linux Desktop — XFCE', description: 'Full XFCE desktop — mic, speaker & camera work', hint: 'Recommended · mic + camera', media: true },
+  { id: 'icewm-desktop', label: 'Linux Desktop — IceWM (lightweight)', description: 'Snappier lightweight desktop — mic, speaker & camera work', hint: 'Lightweight · mic + camera', media: true },
   { id: 'chrome-node', label: 'Chrome Node', description: 'Automated Chrome (Selenium)' },
   { id: 'firefox-node', label: 'Firefox Node', description: 'Automated Firefox (Selenium)' },
 ];
 function templates() { return store.templates && store.templates.length ? store.templates : FALLBACK_TEMPLATES; }
 
-function iconFor(t) { return (t === 'linux-desktop' || t === 'icewm-desktop' || t === 'media-desktop') ? ICONS.desktop : (t === 'chrome-node' || t === 'firefox-node') ? ICONS.browser : ICONS.container; }
+function iconFor(t) { return (t === 'linux-desktop' || t === 'icewm-desktop') ? ICONS.desktop : (t === 'chrome-node' || t === 'firefox-node') ? ICONS.browser : ICONS.container; }
 
 // Two-step create: pick a category, then a specific template inside it.
 const CATEGORIES = [
-  { id: 'desktop', label: 'Linux Desktop', desc: 'A full graphical Linux desktop in your browser', templateIds: ['linux-desktop', 'icewm-desktop', 'media-desktop'], hintCls: 'rec' },
+  { id: 'desktop', label: 'Linux Desktop', desc: 'A full graphical Linux desktop (with mic + camera) in your browser', templateIds: ['linux-desktop', 'icewm-desktop'], hintCls: 'rec' },
   { id: 'browser', label: 'Browser Node', desc: 'Automated Chrome / Firefox for testing (Selenium)', templateIds: ['chrome-node', 'firefox-node'], hintCls: 'lite' },
 ];
 function templatesInCategory(catId) {
@@ -331,7 +330,7 @@ async function openCreateWizard(catId) {
   // Media Desktop tip: the viewer's browser will ask permission for mic/camera,
   // and that only works over HTTPS (a "secure context"). Warn when the panel is
   // being used over plain HTTP so the admin knows to open it via the TLS front.
-  const mediaIds = new Set(tpls.filter((t) => t.id === 'media-desktop').map((t) => t.id));
+  const mediaIds = new Set(tpls.filter((t) => t.media).map((t) => t.id));
   const mediaTip = panel.querySelector('#cr-media-tip');
   const secure = window.isSecureContext || store.state?.panel?.secureContext;
   const syncMediaTip = () => {
