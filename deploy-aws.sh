@@ -79,17 +79,20 @@ Environment=VMP_COLIMA=/usr/local/bin/colima-shim
 WantedBy=multi-user.target
 UNIT
 
-# Self-signed cert with PUBLIC_HOST in the SAN. Caddy's `tls internal` does not
-# reliably mint a leaf for a bare IP host, so we supply an explicit cert instead
-# (works for both IP and DNS names; clients trust it once or accept the warning).
-openssl req -x509 -newkey rsa:2048 -nodes \
-  -keyout /etc/caddy/vmpanel.key -out /etc/caddy/vmpanel.crt \
-  -days 3650 -subj "/CN=${PUBLIC_HOST}" \
-  -addext "subjectAltName=$(echo "$PUBLIC_HOST" | grep -qE '^[0-9.]+$' && echo "IP:${PUBLIC_HOST}" || echo "DNS:${PUBLIC_HOST}"),DNS:localhost" >/dev/null 2>&1
-chown root:caddy /etc/caddy/vmpanel.key /etc/caddy/vmpanel.crt
-chmod 640 /etc/caddy/vmpanel.key; chmod 644 /etc/caddy/vmpanel.crt
-
-cat > /etc/caddy/Caddyfile <<CADDY
+# TLS front. A DNS PUBLIC_HOST (e.g. a sslip.io magic-DNS name) gets a REAL
+# Let's Encrypt cert via Caddy automatic HTTPS — no browser warning, and (the
+# reason it matters) getUserMedia mic/camera work, which a cert-error origin
+# blocks. A bare-IP PUBLIC_HOST cannot get a public cert, so it falls back to a
+# self-signed cert with the IP in the SAN (browser warning; mic/camera limited).
+if echo "$PUBLIC_HOST" | grep -qE '^[0-9.]+$'; then
+	echo "  PUBLIC_HOST is a bare IP — using a self-signed cert (no public CA issues IP certs)."
+	openssl req -x509 -newkey rsa:2048 -nodes \
+	  -keyout /etc/caddy/vmpanel.key -out /etc/caddy/vmpanel.crt \
+	  -days 3650 -subj "/CN=${PUBLIC_HOST}" \
+	  -addext "subjectAltName=IP:${PUBLIC_HOST},DNS:localhost" >/dev/null 2>&1
+	chown root:caddy /etc/caddy/vmpanel.key /etc/caddy/vmpanel.crt
+	chmod 640 /etc/caddy/vmpanel.key; chmod 644 /etc/caddy/vmpanel.crt
+	cat > /etc/caddy/Caddyfile <<CADDY
 {
 	auto_https disable_redirects
 }
@@ -106,6 +109,24 @@ cat > /etc/caddy/Caddyfile <<CADDY
 	}
 }
 CADDY
+else
+	echo "  PUBLIC_HOST is a DNS name — using Caddy automatic HTTPS (Let's Encrypt)."
+	# Port 80 is often closed in the security group, so HTTP-01 may fail; Caddy
+	# also tries TLS-ALPN-01 on 443 (open), which succeeds. Certs are cached in
+	# /var/lib/caddy so restarts do not re-hit Let's Encrypt rate limits.
+	cat > /etc/caddy/Caddyfile <<CADDY
+${PUBLIC_HOST} {
+	reverse_proxy 127.0.0.1:5050 {
+		header_up Host 127.0.0.1:5050
+	}
+}
+${PUBLIC_HOST}:5443 {
+	reverse_proxy 127.0.0.1:5051 {
+		header_up Host 127.0.0.1:5051
+	}
+}
+CADDY
+fi
 
 echo "[7/7] Starting services…"
 systemctl daemon-reload

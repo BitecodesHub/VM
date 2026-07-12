@@ -58,11 +58,17 @@ export function topDialog() { return dialogStack[dialogStack.length - 1]?.overla
 // Tear down EVERY open dialog — used on session expiry (401) so no modal is left
 // stacked on top of the login screen. Clears the focus-trap stack, removes the
 // dynamically-created overlays (create wizard, files, sharing, create-user), and
-// hides the permanent ones.
+// hides the permanent ones. The permanent overlays are STATIC markup in
+// index.html — they must be HIDDEN, never removed, or later code that reaches
+// into them (e.g. app.js resetting #viewer-frame on 401) hits a null node and
+// the whole boot/logout path throws.
+const PERMANENT_OVERLAYS = new Set(['viewer', 'logs', 'confirm', 'change-pw', 'credential']);
 export function closeAllDialogs() {
   dialogStack.length = 0;
-  document.querySelectorAll('.overlay[data-overlay]').forEach((n) => n.remove());
-  ['#viewer', '#logs', '#confirm', '#change-pw', '#credential'].forEach((s) => document.querySelector(s)?.classList.add('hidden'));
+  document.querySelectorAll('.overlay[data-overlay]').forEach((n) => {
+    if (PERMANENT_OVERLAYS.has(n.id)) n.classList.add('hidden');
+    else n.remove();
+  });
 }
 
 // Global Tab trap for the topmost dialog.

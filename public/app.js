@@ -30,7 +30,7 @@ setUnauthorizedHandler(() => {
   resolveConfirm(false);
   closeStatsPop();
   stopResources();
-  $('#viewer-frame').src = 'about:blank';
+  const vf = $('#viewer-frame'); if (vf) vf.src = 'about:blank'; // may be absent (cold boot / after teardown)
   showLoginNotice(wasIn ? 'Your session expired. Please sign in again.' : '');
   showView('login');
   setFavicon('normal'); setTitle('PRISM Virtual Desktop');
