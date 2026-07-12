@@ -43,8 +43,13 @@ RUN set -e; cd /usr/share/kasmvnc/www \
 
 LABEL vmpanel.image="linux-desktop-xfce"
 
-# Uploads dir (kasm-user is uid/gid 1000).
-RUN mkdir -p /home/kasm-user/Uploads && chown -R 1000:1000 /home/kasm-user/Uploads
+# Uploads dir + fix home ownership. Root-run build steps (wget/apt) leak
+# root-owned dirs into /home/kasm-user (e.g. .cache 700 root), which blocks the
+# desktop user (uid 1000) from creating its Firefox profile → "Profile Missing".
+# Own the WHOLE home as uid 1000 so apps work.
+RUN mkdir -p /home/kasm-user/Uploads \
+ && rm -rf /home/kasm-user/.cache /home/kasm-user/.wget-hsts \
+ && chown -R 1000:1000 /home/kasm-user
 
 # Liveness: KasmVNC serves HTTPS on 6901 (answers 401 until Basic auth, which
 # still proves it is up — so any response is success, no response is wedged).

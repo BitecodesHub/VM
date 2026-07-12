@@ -46,7 +46,11 @@ RUN set -e; cd /usr/share/kasmvnc/www \
 
 LABEL vmpanel.image="linux-desktop-icewm"
 
-RUN mkdir -p /home/kasm-user/Uploads && chown -R 1000:1000 /home/kasm-user/Uploads
+# Own the WHOLE home as uid 1000 — root-run build steps leak root-owned dirs
+# (e.g. .cache 700 root) that block the desktop user's Firefox profile.
+RUN mkdir -p /home/kasm-user/Uploads \
+ && rm -rf /home/kasm-user/.cache /home/kasm-user/.wget-hsts \
+ && chown -R 1000:1000 /home/kasm-user
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
   CMD curl -sk https://localhost:6901/ -o /dev/null || exit 1
