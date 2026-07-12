@@ -51,6 +51,13 @@ RUN mkdir -p /home/kasm-user/Uploads \
  && rm -rf /home/kasm-user/.cache /home/kasm-user/.wget-hsts \
  && chown -R 1000:1000 /home/kasm-user
 
+# Pre-create a default Firefox profile so it never shows "Profile Missing" /
+# the Profile Manager on first launch (auto-creation is unreliable under the
+# software-GL headless X).
+RUN mkdir -p /home/kasm-user/.mozilla/firefox/prism.default \
+ && printf '[Profile0]\nName=default\nIsRelative=1\nPath=prism.default\nDefault=1\n\n[General]\nStartWithLastProfile=1\nVersion=2\n' > /home/kasm-user/.mozilla/firefox/profiles.ini \
+ && chown -R 1000:1000 /home/kasm-user/.mozilla
+
 # Liveness: KasmVNC serves HTTPS on 6901 (answers 401 until Basic auth, which
 # still proves it is up — so any response is success, no response is wedged).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \

@@ -52,6 +52,12 @@ RUN mkdir -p /home/kasm-user/Uploads \
  && rm -rf /home/kasm-user/.cache /home/kasm-user/.wget-hsts \
  && chown -R 1000:1000 /home/kasm-user
 
+# Pre-create a default Firefox profile so it never shows "Profile Missing" /
+# the Profile Manager on first launch.
+RUN mkdir -p /home/kasm-user/.mozilla/firefox/prism.default \
+ && printf '[Profile0]\nName=default\nIsRelative=1\nPath=prism.default\nDefault=1\n\n[General]\nStartWithLastProfile=1\nVersion=2\n' > /home/kasm-user/.mozilla/firefox/profiles.ini \
+ && chown -R 1000:1000 /home/kasm-user/.mozilla
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
   CMD curl -sk https://localhost:6901/ -o /dev/null || exit 1
 
