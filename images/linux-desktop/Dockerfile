@@ -29,6 +29,17 @@ RUN install -d -m 0755 /etc/apt/keyrings \
   && apt-get update && apt-get install -y --no-install-recommends firefox \
   && rm -rf /var/lib/apt/lists/*
 
+# Rebrand the KasmVNC web client so it never shows "Kasm" to users: retitle,
+# replace the visible product name with PRISM, and blank the Kasm logo/favicon
+# assets. Only display strings + images are touched — internal identifiers and
+# the kasm_audio/websockify paths (not user-visible) are left intact.
+RUN set -e; cd /usr/share/kasmvnc/www \
+ && sed -i 's#<title>KasmVNC</title>#<title>PRISM Virtual Desktop</title>#g' index.html vnc.html \
+ && for f in index.html vnc.html main.bundle.js screen.bundle.js; do [ -f "$f" ] && sed -i 's/KasmVNC/PRISM/g' "$f" || true; done \
+ && printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC' | base64 -d > /tmp/blank.png \
+ && for f in assets/*kasm*logo*.png; do cp /tmp/blank.png "$f"; done \
+ && rm -f /tmp/blank.png
+
 LABEL vmpanel.image="linux-desktop-xfce"
 
 # Uploads dir (kasm-user is uid/gid 1000).

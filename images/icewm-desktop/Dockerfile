@@ -33,6 +33,16 @@ ENV START_XFCE4=0 \
 RUN printf '#!/usr/bin/env bash\nexport DISPLAY=:1\nexec /usr/bin/icewm-session\n' > /dockerstartup/custom_startup.sh \
   && chmod +x /dockerstartup/custom_startup.sh
 
+# Rebrand the KasmVNC web client so it never shows "Kasm" to users (see the XFCE
+# image for rationale): retitle, replace the visible product name with PRISM, and
+# blank the Kasm logo/favicon assets. Internal kasm_audio/websockify paths intact.
+RUN set -e; cd /usr/share/kasmvnc/www \
+ && sed -i 's#<title>KasmVNC</title>#<title>PRISM Virtual Desktop</title>#g' index.html vnc.html \
+ && for f in index.html vnc.html main.bundle.js screen.bundle.js; do [ -f "$f" ] && sed -i 's/KasmVNC/PRISM/g' "$f" || true; done \
+ && printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC' | base64 -d > /tmp/blank.png \
+ && for f in assets/*kasm*logo*.png; do cp /tmp/blank.png "$f"; done \
+ && rm -f /tmp/blank.png
+
 LABEL vmpanel.image="linux-desktop-icewm"
 
 RUN mkdir -p /home/kasm-user/Uploads && chown -R 1000:1000 /home/kasm-user/Uploads
