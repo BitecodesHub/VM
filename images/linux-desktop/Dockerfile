@@ -12,6 +12,9 @@ FROM kasmweb/core-ubuntu-noble:1.17.0
 
 USER root
 ENV DEBIAN_FRONTEND=noninteractive
+# GPU-less cloud host: force Mesa software GL so apps (Firefox) don't loop on
+# failed hardware/zink init.
+ENV LIBGL_ALWAYS_SOFTWARE=1
 
 # Apps that make the media devices usable + verifiable.
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -56,6 +59,7 @@ RUN mkdir -p /home/kasm-user/Uploads \
 # software-GL headless X).
 RUN mkdir -p /home/kasm-user/.mozilla/firefox/prism.default \
  && printf '[Profile0]\nName=default\nIsRelative=1\nPath=prism.default\nDefault=1\n\n[General]\nStartWithLastProfile=1\nVersion=2\n' > /home/kasm-user/.mozilla/firefox/profiles.ini \
+ && printf 'user_pref("gfx.webrender.software", true);\nuser_pref("gfx.canvas.accelerated", false);\nuser_pref("layers.acceleration.disabled", true);\nuser_pref("webgl.disabled", true);\nuser_pref("browser.shell.checkDefaultBrowser", false);\nuser_pref("datareporting.policy.dataSubmissionEnabled", false);\nuser_pref("browser.aboutwelcome.enabled", false);\nuser_pref("toolkit.telemetry.reportingpolicy.firstRun", false);\n' > /home/kasm-user/.mozilla/firefox/prism.default/user.js \
  && chown -R 1000:1000 /home/kasm-user/.mozilla
 
 # Liveness: KasmVNC serves HTTPS on 6901 (answers 401 until Basic auth, which
