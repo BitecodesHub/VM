@@ -182,18 +182,18 @@ function seedMediaMachine(owner, uiPort, webcam = '0') {
   return seedMachine(owner, uiPort, 'running', { name: 'media-1', webcam });
 }
 
-test('media: stale hostWebcam degrades to audio-only (create succeeds, no 500)', async () => {
-  // config.hostWebcam:true but the fake host has no camera device → docker run
-  // fails with a device error. The panel must retry without --device, not 500.
-  await withPanel({ config: { hostWebcam: true }, env: { FAKE_DOCKER_NO_VIDEO: '1' } }, async (panel) => {
+test('media: desktop is created camera-off — no --device, even when the host has a webcam', async () => {
+  // Camera is off by default (the webcam service is a heavy idle-CPU spinner).
+  // Creating a desktop must succeed and map no camera device regardless of the
+  // host having one; mic + speaker still work.
+  await withPanel({ config: { hostWebcam: true } }, async (panel) => {
     const admin = await setupAdmin(panel);
     const r = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop' } });
-    assert.equal(r.status, 202, 'media create succeeds (degraded to audio-only), not a 500');
-    // The created container carries no --device, so its webcam label is 0.
+    assert.equal(r.status, 202, 'desktop create succeeds');
     const w = panel.readWorld();
     const media = Object.values(w.containers).find((c) => c.labels['vmpanel.template'] === 'linux-desktop');
     assert.ok(media, 'a desktop container was created');
-    assert.equal(media.labels['vmpanel.webcam'], '0', 'created without the camera device (audio/mic still work)');
+    assert.equal(media.labels['vmpanel.webcam'], undefined, 'no camera device mapped (camera off by default)');
   });
 });
 

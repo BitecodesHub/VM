@@ -334,14 +334,14 @@ test('template registry: 4 templates, correct images/prefixes/memory', () => {
   assert.equal(lt.find((t) => t.id === 'linux-desktop').media, true, 'listTemplates surfaces the media flag');
 });
 
-test('desktop templates: BOTH are KasmVNC media (TLS + Basic-auth, VNC_PW, webcam, no URL password)', () => {
+test('desktop templates: BOTH are KasmVNC media (TLS + Basic-auth, VNC_PW, camera OFF, no URL password)', () => {
   for (const id of ['linux-desktop', 'icewm-desktop']) {
     const m = TEMPLATES[id];
-    assert.equal(m.media, true, `${id} is media`);
-    assert.equal(m.needsWebcam, true, `${id} maps webcam`);
+    assert.equal(m.media, true, `${id} is media (mic + speaker)`);
+    assert.equal(m.needsWebcam, false, `${id} has camera OFF by default (webcam service is a CPU hog)`);
     assert.equal(m.backendTls, true, `${id} speaks HTTPS to the backend`);
     assert.deepEqual(m.backendAuth, { user: 'kasm_user', pass: 'secret' });
-    assert.deepEqual(m.env, [{ name: 'VNC_PW', value: 'secret' }]);
+    assert.deepEqual(m.env, [{ name: 'VNC_PW', value: 'secret' }, { name: 'KASM_SVC_WEBCAM', value: '0' }], `${id}: audio env + webcam service disabled`);
     assert.equal(m.ui.password.mode, 'none', `${id}: Basic auth, no VNC password in URL`);
     assert.equal(m.ports.find((p) => p.role === 'ui').containerPort, 6901);
   }
@@ -349,20 +349,23 @@ test('desktop templates: BOTH are KasmVNC media (TLS + Basic-auth, VNC_PW, webca
   assert.equal(TEMPLATES['icewm-desktop'].image, 'minimal-linux-desktop:icewm');
 });
 
-test('buildRunArgs desktop: emits VNC_PW; webcam device only when host has one', () => {
+test('buildRunArgs desktop: emits VNC_PW + KASM_SVC_WEBCAM=0; never maps a camera device (webcam off by default)', () => {
+  // Camera is OFF by default: Kasm's webcam service busy-loops against an idle
+  // v4l2loopback device (~1-1.5 vCPU/desktop), so both templates set
+  // needsWebcam:false and pass KASM_SVC_WEBCAM=0. Mic + speaker are unaffected.
   const base = { template: 'linux-desktop', name: 'desktop-1', owner: 'alice', ports: { ui: 6201 }, createdAt: 'x' };
-  // No host webcam: env present, device absent, label records 0.
+  const envOf = (args) => args.reduce((acc, a, i) => (args[i - 1] === '-e' ? [...acc, a] : acc), []);
   const noCam = buildRunArgs(base);
-  assert.equal(noCam[noCam.indexOf('-e') + 1], 'VNC_PW=secret');
-  assert.ok(!noCam.includes('--device'), 'no device mapped without a host camera');
-  assert.ok(noCam.includes('vmpanel.webcam=0'));
+  assert.ok(envOf(noCam).includes('VNC_PW=secret'), 'VNC_PW env present (audio auth)');
+  assert.ok(envOf(noCam).includes('KASM_SVC_WEBCAM=0'), 'webcam service disabled — the idle-CPU-hog fix');
+  assert.ok(!noCam.includes('--device'), 'no camera device mapped');
+  assert.ok(!noCam.some((a) => String(a).startsWith('vmpanel.webcam=')), 'no webcam label (camera off, not host-conditional)');
   assert.ok(noCam.includes('127.0.0.1:6201:6901'), 'loopback-bound KasmVNC port');
   assert.equal(noCam[noCam.length - 1], 'minimal-linux-desktop:xfce');
-  // Host webcam present: device mapped, label records 1.
-  const withCam = buildRunArgs({ ...base, hostWebcam: true });
-  assert.equal(withCam[withCam.indexOf('--device') + 1], '/dev/video0:/dev/video0');
-  assert.ok(withCam.includes('vmpanel.webcam=1'));
-  assert.ok(!withCam.includes('--memory'), 'shared by default (no caps)');
+  // Even when the host HAS a camera device, desktops no longer map it by default.
+  const withHostCam = buildRunArgs({ ...base, hostWebcam: true });
+  assert.ok(!withHostCam.includes('--device'), 'camera stays off even when the host has a device (needsWebcam:false)');
+  assert.ok(!withHostCam.includes('--memory'), 'shared by default (no caps)');
 });
 
 test('buildRunArgs: Selenium nodes (non-media) emit no VNC_PW env or webcam label', () => {

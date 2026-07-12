@@ -18,8 +18,8 @@ function bootElapsed(name, running, ready) {
 
 // Fallback tile list until /api/templates loads (store.templates is authoritative).
 const FALLBACK_TEMPLATES = [
-  { id: 'linux-desktop', label: 'Linux Desktop — XFCE', description: 'Full XFCE desktop — mic, speaker & camera work', hint: 'Recommended · mic + camera', media: true },
-  { id: 'icewm-desktop', label: 'Linux Desktop — IceWM (lightweight)', description: 'Snappier lightweight desktop — mic, speaker & camera work', hint: 'Lightweight · mic + camera', media: true },
+  { id: 'linux-desktop', label: 'Linux Desktop — XFCE', description: 'Full XFCE desktop — mic & speaker work', hint: 'Recommended · mic + speaker', media: true },
+  { id: 'icewm-desktop', label: 'Linux Desktop — IceWM (lightweight)', description: 'Snappier lightweight desktop — mic & speaker work', hint: 'Lightweight · mic + speaker', media: true },
   { id: 'chrome-node', label: 'Chrome Node', description: 'Automated Chrome (Selenium)' },
   { id: 'firefox-node', label: 'Firefox Node', description: 'Automated Firefox (Selenium)' },
 ];
@@ -29,7 +29,7 @@ function iconFor(t) { return (t === 'linux-desktop' || t === 'icewm-desktop') ? 
 
 // Two-step create: pick a category, then a specific template inside it.
 const CATEGORIES = [
-  { id: 'desktop', label: 'Linux Desktop', desc: 'A full graphical Linux desktop (with mic + camera) in your browser', templateIds: ['linux-desktop', 'icewm-desktop'], hintCls: 'rec' },
+  { id: 'desktop', label: 'Linux Desktop', desc: 'A full graphical Linux desktop (with mic + speaker) in your browser', templateIds: ['linux-desktop', 'icewm-desktop'], hintCls: 'rec' },
   { id: 'browser', label: 'Browser Node', desc: 'Automated Chrome / Firefox for testing (Selenium)', templateIds: ['chrome-node', 'firefox-node'], hintCls: 'lite' },
 ];
 function templatesInCategory(catId) {
@@ -168,14 +168,13 @@ function renderCard(m, showOwner) {
   if (m.localOnly) badges.appendChild(el('<span class="badge" title="Only reachable on the host Mac">local only</span>'));
   if (m.capped) badges.appendChild(el('<span class="badge" title="CPU & memory hard-capped for this machine">capped</span>'));
   if (m.media) {
-    // Speaker + mic always work; the camera badge reflects whether a webcam
-    // device was actually mapped in at create time (host-dependent).
-    const cam = m.camera === true ? 'mic · speaker · camera'
-      : m.camera === false ? 'mic · speaker (no camera on host)'
-      : 'mic · speaker · camera';
-    const camTitle = m.camera === false
-      ? 'Audio in/out work; webcam unavailable because the host has no camera device'
-      : 'Speaker, microphone and webcam work in this desktop';
+    // Speaker + mic always work. Camera is off by default (the webcam service is
+    // a heavy CPU spinner), so only show the camera capability when one was
+    // explicitly mapped in at create time.
+    const cam = m.camera === true ? 'mic · speaker · camera' : 'mic · speaker';
+    const camTitle = m.camera === true
+      ? 'Speaker, microphone and webcam work in this desktop'
+      : 'Speaker and microphone work in this desktop';
     badges.appendChild(el(`<span class="badge media-badge" title="${esc(camTitle)}">${esc(cam)}</span>`));
   }
   // ⓘ resource usage — for running machines the user can see.
@@ -337,8 +336,8 @@ async function openCreateWizard(catId) {
     const sel = panel.querySelector('input[name=tpl]:checked')?.value;
     if (sel && mediaIds.has(sel)) {
       mediaTip.innerHTML = secure
-        ? '🎙️ When you open this desktop, your browser will ask to use the microphone and camera — allow it. Speaker plays automatically.'
-        : '⚠️ Speaker, mic and camera need HTTPS. Open the panel via its secure address (the TLS front) or the browser will block the microphone and camera.';
+        ? '🎙️ When you open this desktop, your browser will ask to use the microphone — allow it. Speaker plays automatically. (Camera is off by default.)'
+        : '⚠️ Speaker and mic need HTTPS. Open the panel via its secure address (the TLS front) or the browser will block the microphone.';
       mediaTip.classList.toggle('warn', !secure);
       mediaTip.classList.remove('hidden');
     } else {
