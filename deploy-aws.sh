@@ -73,18 +73,28 @@ Environment=VMP_COLIMA=/usr/local/bin/colima-shim
 WantedBy=multi-user.target
 UNIT
 
+# Self-signed cert with PUBLIC_HOST in the SAN. Caddy's `tls internal` does not
+# reliably mint a leaf for a bare IP host, so we supply an explicit cert instead
+# (works for both IP and DNS names; clients trust it once or accept the warning).
+openssl req -x509 -newkey rsa:2048 -nodes \
+  -keyout /etc/caddy/vmpanel.key -out /etc/caddy/vmpanel.crt \
+  -days 3650 -subj "/CN=${PUBLIC_HOST}" \
+  -addext "subjectAltName=$(echo "$PUBLIC_HOST" | grep -qE '^[0-9.]+$' && echo "IP:${PUBLIC_HOST}" || echo "DNS:${PUBLIC_HOST}"),DNS:localhost" >/dev/null 2>&1
+chown root:caddy /etc/caddy/vmpanel.key /etc/caddy/vmpanel.crt
+chmod 640 /etc/caddy/vmpanel.key; chmod 644 /etc/caddy/vmpanel.crt
+
 cat > /etc/caddy/Caddyfile <<CADDY
 {
-	skip_install_trust
+	auto_https disable_redirects
 }
 :443 {
-	tls internal
+	tls /etc/caddy/vmpanel.crt /etc/caddy/vmpanel.key
 	reverse_proxy 127.0.0.1:5050 {
 		header_up Host 127.0.0.1:5050
 	}
 }
 :5443 {
-	tls internal
+	tls /etc/caddy/vmpanel.crt /etc/caddy/vmpanel.key
 	reverse_proxy 127.0.0.1:5051 {
 		header_up Host 127.0.0.1:5051
 	}
