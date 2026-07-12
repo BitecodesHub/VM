@@ -113,4 +113,4 @@ systemctl enable --now vm-panel.service
 systemctl restart caddy
 
 echo "DEPLOY_OK — open https://${PUBLIC_HOST}/ to create the admin account."
-echo "Caddy internal root CA (trust on clients for mic/camera): /var/lib/caddy/.local/share/caddy/pki/authorities/local/root.crt"
+echo "TLS cert (self-signed; trust on clients or accept the warning for mic/camera): /etc/caddy/vmpanel.crt"

@@ -24,8 +24,12 @@ RUN install -d -m 0755 /etc/apt/keyrings \
   && apt-get update && apt-get install -y --no-install-recommends firefox \
   && rm -rf /var/lib/apt/lists/*
 
-# Disable the base image's XFCE and launch IceWM via KasmVNC's custom_startup hook.
-ENV START_XFCE4=0
+# Disable the base image's XFCE and launch IceWM via KasmVNC's custom_startup
+# hook. Both overrides are required: kasm starts XFCE when START_XFCE4=1 OR
+# START_DE=="xfce4-session" (the base image's default), so we must clear both,
+# else XFCE runs alongside IceWM.
+ENV START_XFCE4=0 \
+    START_DE=icewm
 RUN printf '#!/usr/bin/env bash\nexport DISPLAY=:1\nexec /usr/bin/icewm-session\n' > /dockerstartup/custom_startup.sh \
   && chmod +x /dockerstartup/custom_startup.sh
 
