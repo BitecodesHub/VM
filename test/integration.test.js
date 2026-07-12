@@ -710,3 +710,16 @@ test('state: panel payload surfaces the app version', async () => {
     assert.match(String(st.json.panel.version), /^\d+\.\d+\.\d+/, 'semver-ish version present');
   });
 });
+
+// ---- Readiness over TLS (KasmVNC desktops) ---------------------------------
+test('readiness: a TLS (KasmVNC) backend is probed over HTTPS and reports ready', async () => {
+  const backend = await startBackend(); // HTTPS
+  try {
+    await withPanel({ world: seedMachine('alice', backend.port) }, async (panel) => {
+      const admin = await setupAdmin(panel); // admin can probe any machine
+      const r = await panel.req('GET', '/api/machines/desktop-1/ready', { cookie: admin });
+      assert.equal(r.status, 200);
+      assert.equal(r.json.ready, true, 'HTTPS-backed desktop probes ready (not stuck Booting)');
+    });
+  } finally { backend.close(); }
+});

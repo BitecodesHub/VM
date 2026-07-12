@@ -1,4 +1,5 @@
 import http from 'node:http';
+import https from 'node:https';
 import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
@@ -640,9 +641,14 @@ async function getLogs(user, name, tailN) {
   return { status: 200, text: (r.stdout || '') + (r.stderr || '') };
 }
 
-function httpProbe(port) {
+// `tls` must match the backend: KasmVNC desktops serve HTTPS (and answer 401
+// until Basic auth, which still means "up"), so a plain-HTTP probe against them
+// always fails and leaves the card stuck on "Booting…". Any status < 500 = up.
+function httpProbe(port, tls = false) {
   return new Promise((resolve) => {
-    const req = http.get({ host: LOOPBACK, port, path: '/', timeout: 2000 }, (res) => {
+    const mod = tls ? https : http;
+    const opts = { host: LOOPBACK, port, path: '/', timeout: 2000, ...(tls ? { rejectUnauthorized: false, servername: 'localhost' } : {}) };
+    const req = mod.get(opts, (res) => {
       res.resume();
       resolve(res.statusCode > 0 && res.statusCode < 500);
     });
@@ -655,7 +661,7 @@ async function readiness(user, name) {
   if (resolved.error) return resolved.error;
   const { card } = resolved;
   if (card.state !== 'running' || !card.uiPort) return { status: 200, body: { ready: false, checkedAt: new Date().toISOString() } };
-  const ready = await httpProbe(card.uiPort);
+  const ready = await httpProbe(card.uiPort, backendProxyOpts(card).backendTls);
   return { status: 200, body: { ready, url: card.uiUrl, checkedAt: new Date().toISOString() } };
 }
 
