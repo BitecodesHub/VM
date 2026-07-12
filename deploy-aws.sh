@@ -79,11 +79,15 @@ cat > /etc/caddy/Caddyfile <<CADDY
 }
 :443 {
 	tls internal
-	reverse_proxy 127.0.0.1:5050 { header_up Host 127.0.0.1:5050 }
+	reverse_proxy 127.0.0.1:5050 {
+		header_up Host 127.0.0.1:5050
+	}
 }
 :5443 {
 	tls internal
-	reverse_proxy 127.0.0.1:5051 { header_up Host 127.0.0.1:5051 }
+	reverse_proxy 127.0.0.1:5051 {
+		header_up Host 127.0.0.1:5051
+	}
 }
 CADDY
 

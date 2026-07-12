@@ -105,8 +105,20 @@ setInterval(() => sessions.sweep(), 10 * 60 * 1000).unref?.();
 // 5050/5051 keeps working). The guards accept these so requests proxied through
 // Caddy pass CSRF/Origin checks; screens are framed by, and served from, these.
 function publicHosts() { return config.publicTls && config.publicHost ? [config.publicHost, 'localhost'] : []; }
-function isPanelPublicOrigin(origin) { return publicHosts().some((h) => origin === `https://${h}:${config.panelHttpsPort}`); }
-function isMachinePublicOrigin(origin) { return publicHosts().some((h) => origin === `https://${h}:${config.machineHttpsPort}`); }
+// Acceptable HTTPS origins for a given public port. Browsers OMIT the default
+// :443 from the Origin header (`https://host`, not `https://host:443`), so when
+// the front is on 443 we must accept the port-less form too — otherwise the
+// CSRF/Origin guard rejects every POST (login included) on a :443 deployment.
+function publicOrigins(port) {
+  const out = [];
+  for (const h of publicHosts()) {
+    out.push(`https://${h}:${port}`);
+    if (port === 443) out.push(`https://${h}`);
+  }
+  return out;
+}
+function isPanelPublicOrigin(origin) { return publicOrigins(config.panelHttpsPort).includes(origin); }
+function isMachinePublicOrigin(origin) { return publicOrigins(config.machineHttpsPort).includes(origin); }
 
 // Does the docker daemon's host expose a v4l2loopback camera we can map into a
 // Media Desktop? Explicit config wins; otherwise auto-detect a /dev/video0 the
@@ -1481,8 +1493,9 @@ function panelFrameAncestors(req) {
   host = host || 'localhost';
   const parts = [`'self'`, `http://${host}:${config.port}`, `https://${host}:${config.port}`];
   // Behind the Caddy TLS front the panel page loads from its public HTTPS origin;
-  // allow it to frame the screens (which are proxied via the machine HTTPS port).
-  for (const ph of publicHosts()) parts.push(`https://${ph}:${config.panelHttpsPort}`);
+  // allow it to frame the screens. Include the port-less :443 form (browsers omit
+  // the default port) so framing is not blocked on a :443 deployment.
+  for (const o of publicOrigins(config.panelHttpsPort)) parts.push(o);
   return parts.join(' ');
 }
 
