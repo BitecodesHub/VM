@@ -38,7 +38,8 @@ RUN set -e; cd /usr/share/kasmvnc/www \
  && for f in index.html vnc.html main.bundle.js screen.bundle.js; do [ -f "$f" ] && sed -i 's/KasmVNC/PRISM/g' "$f" || true; done \
  && printf '%s' 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M8AAAMBAQDJ/pLvAAAAAElFTkSuQmCC' | base64 -d > /tmp/blank.png \
  && for f in assets/*kasm*logo*.png; do cp /tmp/blank.png "$f"; done \
- && rm -f /tmp/blank.png
+ && rm -f /tmp/blank.png \
+ && printf '%s' ';try{(function(){var T="PRISM Virtual Desktop";function f(){try{if(document.title!==T)document.title=T}catch(e){}}f();setInterval(f,700)})()}catch(e){}' >> main.bundle.js
 
 LABEL vmpanel.image="linux-desktop-xfce"
 
