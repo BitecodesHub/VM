@@ -79,6 +79,34 @@ Environment=VMP_COLIMA=/usr/local/bin/colima-shim
 WantedBy=multi-user.target
 UNIT
 
+# Daily data backup (audit blocker: without this, users.json / secret / config /
+# sessions are lost on instance replacement). Writes a verified, pruned tarball.
+# BACKUP_DIR defaults to $APP_DIR/backups (on the persistent root EBS volume, so
+# it survives panel/process restarts + accidental data corruption). For
+# instance-LOSS durability, point VMP_BACKUP_DIR at an off-host path (a separate
+# mounted EBS volume, or an rclone/S3 remote) and/or enable EBS snapshots.
+BACKUP_DIR="${VMP_BACKUP_DIR:-$APP_DIR/backups}"
+mkdir -p "$BACKUP_DIR"; chown -R "$RUN_USER":"$RUN_USER" "$BACKUP_DIR"; chmod 700 "$BACKUP_DIR"
+cat > /etc/systemd/system/vm-panel-backup.service <<UNIT
+[Unit]
+Description=PRISM Virtual Desktop data backup
+[Service]
+Type=oneshot
+User=$RUN_USER
+Environment=VMP_DATA_DIR=$APP_DIR/data
+Environment=VMP_BACKUP_DIR=$BACKUP_DIR
+ExecStart=/bin/bash $APP_DIR/launchers/backup.sh
+UNIT
+cat > /etc/systemd/system/vm-panel-backup.timer <<UNIT
+[Unit]
+Description=Daily PRISM Virtual Desktop backup
+[Timer]
+OnCalendar=daily
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+
 # TLS front. A DNS PUBLIC_HOST (e.g. a sslip.io magic-DNS name) gets a REAL
 # Let's Encrypt cert via Caddy automatic HTTPS — no browser warning, and (the
 # reason it matters) getUserMedia mic/camera work, which a cert-error origin
@@ -133,6 +161,8 @@ fi
 echo "[7/7] Starting services…"
 systemctl daemon-reload
 systemctl enable --now vm-panel.service
+systemctl enable --now vm-panel-backup.timer
+systemctl start vm-panel-backup.service || true   # take an initial backup now
 systemctl restart caddy
 
 echo "DEPLOY_OK — open https://${PUBLIC_HOST}/ to create the admin account."
