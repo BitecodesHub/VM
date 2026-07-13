@@ -12,6 +12,34 @@ import { isStatsPopOpen, closeStatsPop } from './js/stats-pop.js';
 
 const POLL_MS = 4000;
 
+// ---- Theme (light / dark) --------------------------------------------------
+// Applied at module load (before the app renders) so there is no flash. The
+// choice persists in localStorage; first-time visitors follow the OS setting.
+const THEME_KEY = 'vmp_theme';
+function applyTheme(t) {
+  document.documentElement.dataset.theme = t;
+  const btn = $('#theme-btn');
+  if (btn) {
+    btn.textContent = t === 'light' ? '☀' : '☾';
+    btn.setAttribute('aria-label', t === 'light' ? 'Switch to dark theme' : 'Switch to light theme');
+    btn.setAttribute('title', t === 'light' ? 'Switch to dark theme' : 'Switch to light theme');
+  }
+}
+function initTheme() {
+  let t = null;
+  try { t = localStorage.getItem(THEME_KEY); } catch { /* private mode */ }
+  if (t !== 'light' && t !== 'dark') {
+    t = (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches) ? 'light' : 'dark';
+  }
+  applyTheme(t);
+}
+initTheme();
+$('#theme-btn')?.addEventListener('click', () => {
+  const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  try { localStorage.setItem(THEME_KEY, next); } catch { /* private mode */ }
+  applyTheme(next);
+});
+
 // ---- Poller (generation token so it stops cleanly on logout/401) -----------
 const poller = {
   gen: 0,
