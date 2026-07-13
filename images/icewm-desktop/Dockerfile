@@ -51,8 +51,8 @@ RUN set -e; cd /usr/share/kasmvnc/www \
 # itself (it delegates to the paid Workspaces parent), so bundle a jsmpeg player
 # that decodes the panel-proxied audio-out stream (/m/<name>/kasmaudio). Decoding
 # is client-side, so the server only relays bytes.
-COPY jsmpeg.min.js prism-audio.js prism-tuning.js /usr/share/kasmvnc/www/
-RUN sed -i 's#</body>#<script src="prism-tuning.js"></script><script src="jsmpeg.min.js"></script><script src="prism-audio.js"></script></body>#' /usr/share/kasmvnc/www/vnc.html
+COPY jsmpeg.min.js prism-audio.js prism-tuning.js prism-mic.js /usr/share/kasmvnc/www/
+RUN sed -i 's#</body>#<script src="prism-tuning.js"></script><script src="jsmpeg.min.js"></script><script src="prism-audio.js"></script><script src="prism-mic.js"></script></body>#' /usr/share/kasmvnc/www/vnc.html
 
 LABEL vmpanel.image="linux-desktop-icewm"
 

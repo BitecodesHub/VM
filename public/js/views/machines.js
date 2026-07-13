@@ -342,8 +342,8 @@ async function openCreateWizard(catId) {
     const sel = panel.querySelector('input[name=tpl]:checked')?.value;
     if (sel && mediaIds.has(sel)) {
       mediaTip.innerHTML = secure
-        ? '🎙️ When you open this desktop, your browser will ask to use the microphone — allow it. Speaker plays automatically. (Camera is off by default.)'
-        : '⚠️ Speaker and mic need HTTPS. Open the panel via its secure address (the TLS front) or the browser will block the microphone.';
+        ? '🔊 Speaker plays automatically. 🎙️ For your microphone, click the “Mic” button (bottom-right of the desktop) and allow the browser prompt. (Camera is off by default.)'
+        : '⚠️ Speaker and mic need HTTPS. Open the panel via its secure address (the TLS front) or the browser will block audio.';
       mediaTip.classList.toggle('warn', !secure);
       mediaTip.classList.remove('hidden');
     } else {

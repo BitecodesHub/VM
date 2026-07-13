@@ -1575,6 +1575,10 @@ function proxyRoute(card, parsed) {
   if (card.audioPort && /^\/kasmaudio(?:[/?]|$)/.test(rest)) {
     return { port: card.audioPort, target: '/' };
   }
+  // Microphone WS — keep the query (?sample_rate=N) the audio-input server needs.
+  if (card.micPort && /^\/kasmmic(?:[/?]|$)/.test(rest)) {
+    return { port: card.micPort, target: '/' + parsed.query };
+  }
   return { port: card.uiPort, target: rest + parsed.query };
 }
 
