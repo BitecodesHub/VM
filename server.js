@@ -91,8 +91,27 @@ try {
 // Append-only audit trail (privileged actions). Not in the try block — a bad
 // audit file must never block boot; it self-heals on the next trim.
 const audit = new AuditLog(path.join(DATA_DIR, 'audit.jsonl'));
+// Real client IP behind the Caddy loopback front. Caddy appends the true client
+// IP to X-Forwarded-For; trust it ONLY when the immediate peer is loopback (the
+// reverse proxy), and take the RIGHTMOST hop (the one Caddy appended — a client
+// cannot forge entries after it). Direct non-loopback peers are used verbatim so
+// the guard is unspoofable. Without this, every request looks like 127.0.0.1,
+// which collapses the per-IP login limiter into one global bucket (login DoS)
+// and destroys source-IP attribution in the audit log + sessions.
+function clientIp(req) {
+  const peer = req?.socket?.remoteAddress || '';
+  const loopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+  if (loopback) {
+    const xff = req?.headers?.['x-forwarded-for'];
+    if (xff) {
+      const hops = String(xff).split(',').map((s) => s.trim()).filter(Boolean);
+      if (hops.length) return hops[hops.length - 1];
+    }
+  }
+  return peer;
+}
 function recordAudit(req, actor, action, target = null, detail = null) {
-  audit.record({ actor, action, target, detail, ip: req?.socket?.remoteAddress || null });
+  audit.record({ actor, action, target, detail, ip: clientIp(req) || null });
 }
 const firedAlerts = new Set(); // critical alert ids already notified (dedupe webhook/log)
 const loginLimiter = new LoginLimiter();
@@ -171,7 +190,10 @@ async function maintenanceTick() {
       cpuPct: r.used?.cpuPerc ?? null, cpuCores: r.capacity?.cpu ?? null,
       diskUsed: r.used?.disk?.totalBytes ?? null, diskTotal: r.capacity?.diskBytes ?? null,
       running: (r.machines || []).filter((m) => m.state === 'running').length,
-      unhealthy: [...byName.values()].filter((c) => isPanelMachine(c) && c.health === 'unhealthy').length,
+      // Only RUNNING machines can be unhealthy — Docker keeps a stale
+      // Health.Status on cleanly-exited containers, which otherwise raised a
+      // permanent "unhealthy — a restart may fix it" banner on stopped machines.
+      unhealthy: [...byName.values()].filter((c) => isPanelMachine(c) && c.state === 'running' && c.health === 'unhealthy').length,
     });
     evaluateAlerts();
   } catch { /* sampling is best-effort */ }
@@ -1119,7 +1141,7 @@ function accessLog(remote, user, method, rawUrl, status, ms) {
 // ---- Request handler -------------------------------------------------------
 const server = http.createServer(async (req, res) => {
   const started = Date.now();
-  const remote = req.socket.remoteAddress || '-';
+  const remote = clientIp(req) || '-';
   let logUser = null;
   res.on('finish', () => accessLog(remote, logUser, req.method, req.url, res.statusCode, Date.now() - started));
   try {
@@ -1349,7 +1371,7 @@ async function handleSetup(req, res, setUser) {
   if (pwErr) return sendJson(res, 400, { error: { code: 'WEAK_PASSWORD', message: pwErr } });
   if (!users.isEmpty()) return sendJson(res, 409, { error: { code: 'SETUP_ALREADY_DONE', message: 'setup already completed' } });
   const user = await users.create({ username, password, role: 'admin', mustChangePassword: false });
-  const { setCookie } = await sessions.create(username, { ip: req.socket.remoteAddress, userAgent: req.headers['user-agent'] });
+  const { setCookie } = await sessions.create(username, { ip: clientIp(req), userAgent: req.headers['user-agent'] });
   setUser(username);
   recordAudit(req, username, 'setup', username, { role: 'admin' });
   return sendJson(res, 201, { ok: true, user: meBody(user) }, { 'Set-Cookie': setCookie });
@@ -1362,7 +1384,7 @@ async function handleLogin(req, res, setUser) {
   if (!body) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON' } });
   const username = String(body.username || '').toLowerCase();
   const password = String(body.password || '');
-  const ip = req.socket.remoteAddress || '';
+  const ip = clientIp(req) || '';
   const gate = loginLimiter.check(ip, username);
   if (!gate.allowed) {
     const retryAfter = Math.max(1, Math.ceil(gate.retryAfterMs / 1000));
@@ -1512,6 +1534,19 @@ function backendProxyOpts(card) {
   return { backendTls: !!t.backendTls, backendAuth: t.backendAuth || null };
 }
 
+// Pick the backend port + target path for a proxied request. Almost everything
+// goes to the UI port (KasmVNC web + VNC websocket). The one exception is the
+// desktop audio-out stream: the client's /m/<name>/kasmaudio request is routed
+// to the container's separate audio websocket server (published as card.audioPort,
+// which serves at "/"), so desktop speaker audio works over the same proxy.
+function proxyRoute(card, parsed) {
+  const rest = parsed.rest || '';
+  if (card.audioPort && /^\/kasmaudio(?:[/?]|$)/.test(rest)) {
+    return { port: card.audioPort, target: '/' };
+  }
+  return { port: card.uiPort, target: rest + parsed.query };
+}
+
 async function handleProxy(req, res, setUser) {
   const auth = authenticateRequest(req);
   if (!auth) {
@@ -1538,7 +1573,8 @@ async function handleProxy(req, res, setUser) {
   if (card.localOnly || !card.uiPort) return sendHtml(res, 502, errorPage(502, 'Not available here', 'This machine can only be opened on the host Mac.'));
   if (card.state !== 'running') return sendHtml(res, 502, errorPage(502, 'Machine is not running', `“${parsed.name}” is stopped. Start it from PRISM Virtual Desktop, then try again.`));
   touchMachine(parsed.name); // idle-reaper activity signal
-  proxyHttp({ req, res, port: card.uiPort, target: parsed.rest + parsed.query, name: parsed.name, frameAncestors: panelFrameAncestors(req), ...backendProxyOpts(card) });
+  const route = proxyRoute(card, parsed);
+  proxyHttp({ req, res, port: route.port, target: route.target, name: parsed.name, frameAncestors: panelFrameAncestors(req), ...backendProxyOpts(card) });
 }
 
 // Kill any live proxied tunnels belonging to a user (revocation on disable/
@@ -1574,7 +1610,8 @@ async function handleUpgrade(req, socket, head) {
     // someone is actively viewing.
     openMachineConn(parsed.name);
     socket.once('close', () => closeMachineConn(parsed.name));
-    proxyUpgrade({ req, socket, head, port: card.uiPort, target: parsed.rest + parsed.query, upgradedSockets, maxSockets: config.maxUpgradedSockets, ...backendProxyOpts(card) });
+    const route = proxyRoute(card, parsed);
+    proxyUpgrade({ req, socket, head, port: route.port, target: route.target, upgradedSockets, maxSockets: config.maxUpgradedSockets, ...backendProxyOpts(card) });
   } catch {
     socket.destroy();
   }
@@ -1583,7 +1620,7 @@ async function handleUpgrade(req, socket, head) {
 // ---- Machine origin (P0-2): a SECOND server that serves ONLY /m/ ----------
 const machineServer = http.createServer(async (req, res) => {
   const started = Date.now();
-  const remote = req.socket.remoteAddress || '-';
+  const remote = clientIp(req) || '-';
   let logUser = null;
   res.on('finish', () => accessLog(remote, logUser, req.method, req.url, res.statusCode, Date.now() - started));
   try {

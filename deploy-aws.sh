@@ -55,7 +55,7 @@ docker pull seleniarm/standalone-firefox:latest  && docker tag seleniarm/standal
 echo "[5/7] Panel runtime config…"
 mkdir -p "$APP_DIR/data"
 cat > "$APP_DIR/data/config.json" <<CFG
-{"bind":"127.0.0.1","publicTls":true,"publicHost":"$PUBLIC_HOST","panelHttpsPort":443,"machineHttpsPort":5443}
+{"bind":"127.0.0.1","publicTls":true,"publicHost":"$PUBLIC_HOST","panelHttpsPort":443,"machineHttpsPort":5443,"sessionIdleHours":12,"maxRunningMachines":4}
 CFG
 chown -R "$RUN_USER":"$RUN_USER" "$APP_DIR"
 
@@ -116,11 +116,13 @@ else
 	# /var/lib/caddy so restarts do not re-hit Let's Encrypt rate limits.
 	cat > /etc/caddy/Caddyfile <<CADDY
 ${PUBLIC_HOST} {
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	reverse_proxy 127.0.0.1:5050 {
 		header_up Host 127.0.0.1:5050
 	}
 }
 ${PUBLIC_HOST}:5443 {
+	header Strict-Transport-Security "max-age=31536000; includeSubDomains"
 	reverse_proxy 127.0.0.1:5051 {
 		header_up Host 127.0.0.1:5051
 	}

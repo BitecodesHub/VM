@@ -44,6 +44,13 @@ RUN set -e; cd /usr/share/kasmvnc/www \
  && rm -f /tmp/blank.png \
  && printf '%s' ';try{(function(){var T="PRISM Virtual Desktop";function f(){try{if(document.title!==T)document.title=T}catch(e){}}f();setInterval(f,700)})()}catch(e){}' >> main.bundle.js
 
+# Desktop speaker audio. The OSS KasmVNC client does not play desktop audio
+# itself (it delegates to the paid Workspaces parent), so bundle a jsmpeg player
+# that decodes the panel-proxied audio-out stream (/m/<name>/kasmaudio). Decoding
+# is client-side, so the server only relays bytes.
+COPY jsmpeg.min.js prism-audio.js /usr/share/kasmvnc/www/
+RUN sed -i 's#</body>#<script src="jsmpeg.min.js"></script><script src="prism-audio.js"></script></body>#' /usr/share/kasmvnc/www/vnc.html
+
 LABEL vmpanel.image="linux-desktop-xfce"
 
 # Uploads dir + fix home ownership. Root-run build steps (wget/apt) leak
