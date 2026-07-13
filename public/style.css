@@ -411,3 +411,59 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: 
 .legend-swatch.seg-volumes { background: #35b8c4; }
 .legend-swatch.seg-cache { background: var(--muted); }
 .legend-swatch.seg-free { background: var(--card-2); }
+
+/* Card display-name subtitle (machine ID under the friendly name) */
+.card-realname { font-size: 11px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* Edit (✎) icon button — matches the ⓘ button */
+.edit-btn { font-size: 13px; }
+
+/* Popover menu (Edit → Rename / Change access) */
+.pop-menu {
+  position: absolute; z-index: 60; min-width: 180px;
+  background: var(--card); border: 1px solid var(--border-2); border-radius: 10px;
+  box-shadow: var(--shadow-lg); padding: 6px; display: flex; flex-direction: column; gap: 2px;
+}
+.pop-item {
+  display: flex; align-items: center; gap: 9px; width: 100%; text-align: left;
+  background: transparent; border: 0; color: var(--text); font: inherit; font-size: 13px;
+  padding: 8px 10px; border-radius: 7px; cursor: pointer;
+}
+.pop-item:hover, .pop-item:focus-visible { background: var(--card-hover); outline: none; }
+.pop-ico { width: 18px; text-align: center; opacity: .9; }
+
+/* Avatar-chip multi-select (Change access) */
+.ms { position: relative; margin: 10px 0 2px; }
+.ms-chips {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  min-height: 42px; padding: 6px; border: 1px solid var(--border-2); border-radius: 9px; background: var(--card-2);
+}
+.ms-none { color: var(--muted); font-size: 13px; padding: 2px 4px; }
+.ms-chip {
+  display: inline-flex; align-items: center; gap: 6px; padding: 3px 4px 3px 3px;
+  background: var(--accent-tint); border: 1px solid var(--accent-tint-border); color: var(--accent-tint-text);
+  border-radius: 999px; font-size: 12px; font-weight: 500;
+}
+.ms-av {
+  width: 20px; height: 20px; border-radius: 50%; background: var(--accent); color: var(--text-on-accent);
+  display: inline-flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; flex: none;
+}
+.ms-x { border: 0; background: transparent; color: inherit; cursor: pointer; font-size: 15px; line-height: 1; padding: 0 2px; opacity: .7; }
+.ms-x:hover { opacity: 1; }
+.ms-add {
+  border: 1px dashed var(--border-2); background: transparent; color: var(--muted);
+  border-radius: 999px; padding: 4px 12px; font: inherit; font-size: 12px; cursor: pointer;
+}
+.ms-add:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.ms-add:disabled { opacity: .5; cursor: not-allowed; }
+.ms-drop {
+  position: absolute; left: 0; right: 0; top: calc(100% + 4px); z-index: 5; max-height: 220px; overflow-y: auto;
+  background: var(--card); border: 1px solid var(--border-2); border-radius: 9px; box-shadow: var(--shadow-lg); padding: 5px;
+}
+.ms-opt {
+  display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+  background: transparent; border: 0; color: var(--text); font: inherit; font-size: 13px;
+  padding: 7px 9px; border-radius: 7px; cursor: pointer;
+}
+.ms-opt:hover { background: var(--card-hover); }
+.ms-empty { color: var(--muted); font-size: 13px; padding: 8px 9px; }

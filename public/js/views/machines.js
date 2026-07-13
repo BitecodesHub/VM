@@ -157,7 +157,9 @@ function renderCard(m, showOwner) {
   const head = el('<div class="card-head"></div>');
   head.appendChild(el(`<span class="card-ico">${iconFor(m.template)}</span>`));
   const meta = el('<div class="card-headmeta"></div>');
-  meta.appendChild(el(`<span class="card-name">${esc(m.name)}</span>`));
+  meta.appendChild(el(`<span class="card-name">${esc(m.displayName || m.name)}</span>`));
+  // When a friendly name is set, keep the stable machine ID (the /m/<name>/ URL) visible.
+  if (m.displayName && m.displayName !== m.name) meta.appendChild(el(`<span class="card-realname" title="Machine ID / address">${esc(m.name)}</span>`));
   meta.appendChild(el(`<span class="card-type">${esc(m.templateLabel)}</span>`));
   head.appendChild(meta);
   const badges = el('<div class="badges"></div>');
@@ -180,6 +182,10 @@ function renderCard(m, showOwner) {
   // ⓘ resource usage — for running machines the user can see.
   const info = el(`<button class="icon-btn info-btn" data-act="info" title="Resource usage" aria-label="Resource usage for ${esc(m.name)}">i</button>`);
   badges.appendChild(info);
+  // ✎ Edit — rename + (admin) change access. Owner/admin only; not for shared viewers.
+  if (!m.protected && m.access !== 'shared') {
+    badges.appendChild(el(`<button class="icon-btn edit-btn" data-act="edit" title="Edit — rename, access" aria-label="Edit ${esc(m.name)}">✎</button>`));
+  }
   head.appendChild(badges);
   card.appendChild(head);
 
@@ -485,6 +491,7 @@ export function handleMachineClick(e) {
   else if (act === 'files') openFilesModal(name);
   else if (act === 'delete') doDelete(name);
   else if (act === 'info') openStatsPop(name, btn);
+  else if (act === 'edit') openEditMenu(name, btn);
   else if (act === 'access') openAccessModal(name);
   else doLifecycle(name, act);
 }
@@ -578,31 +585,145 @@ async function openFilesModal(name) {
 }
 
 // ---- Manage-access modal (admin) -------------------------------------------
-async function openAccessModal(name) {
-  const [usersRes, accessRes] = await Promise.all([api.get('/api/users'), api.get(`/api/machines/${encodeURIComponent(name)}/access`)]);
-  if (usersRes.handled || accessRes.handled) return;
-  if (!usersRes.ok || !accessRes.ok) { toast('err', friendlyError(usersRes.data || accessRes.data, 'Could not load access')); return; }
-  const owner = accessRes.data.owner;
-  const shared = new Set(accessRes.data.sharedWith || []);
-  const candidates = usersRes.data.users.filter((u) => u.username !== owner && !u.disabled && u.role !== 'admin');
+// ---- Edit menu (rename + access) -------------------------------------------
+// A small popover anchored to the card's ✎ button. Collapses on outside-click,
+// on Escape, and on selecting an item (per the requested behaviour).
+let editMenuState = null;
+function closeEditMenu() {
+  if (!editMenuState) return;
+  document.removeEventListener('mousedown', editMenuState.onDoc, true);
+  document.removeEventListener('keydown', editMenuState.onKey, true);
+  window.removeEventListener('resize', editMenuState.close);
+  window.removeEventListener('scroll', editMenuState.close, true);
+  editMenuState.menu.remove();
+  editMenuState = null;
+}
+function openEditMenu(name, anchor) {
+  if (editMenuState) { closeEditMenu(); return; } // toggle off if already open
+  const isAdmin = store.user?.role === 'admin';
+  const menu = el(`<div class="pop-menu" role="menu">
+    <button class="pop-item" role="menuitem" data-mi="rename"><span class="pop-ico">✎</span> Rename</button>
+    ${isAdmin ? '<button class="pop-item" role="menuitem" data-mi="access"><span class="pop-ico">👥</span> Change access</button>' : ''}
+  </div>`);
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  menu.style.top = `${r.bottom + 6 + window.scrollY}px`;
+  menu.style.left = `${Math.max(8, r.right - menu.offsetWidth + window.scrollX)}px`;
+  menu.addEventListener('click', (e) => {
+    const it = e.target.closest('[data-mi]'); if (!it) return;
+    const mi = it.dataset.mi;
+    closeEditMenu();                     // collapse on select
+    if (mi === 'rename') openRenameDialog(name);
+    else if (mi === 'access') openAccessModal(name);
+  });
+  const close = () => closeEditMenu();
+  editMenuState = {
+    menu, close,
+    onDoc: (e) => { if (!menu.contains(e.target) && e.target !== anchor) closeEditMenu(); }, // collapse on outside-click
+    onKey: (e) => { if (e.key === 'Escape') closeEditMenu(); },
+  };
+  // Defer binding so the opening click does not immediately close it.
+  setTimeout(() => {
+    if (!editMenuState) return;
+    document.addEventListener('mousedown', editMenuState.onDoc, true);
+    document.addEventListener('keydown', editMenuState.onKey, true);
+    window.addEventListener('resize', close);
+    window.addEventListener('scroll', close, true);
+    menu.querySelector('.pop-item')?.focus();
+  }, 0);
+}
 
+// ---- Rename (display name) -------------------------------------------------
+function openRenameDialog(name) {
+  const m = machineByName(name);
+  const current = m?.displayName || '';
   const modal = el('<div class="overlay" data-overlay></div>');
-  const rows = candidates.map((u) => `<label class="check-row"><input type="checkbox" value="${esc(u.username)}" ${shared.has(u.username) ? 'checked' : ''}/> <span>${esc(u.username)}</span></label>`).join('') || '<p class="stat-note">No other users to share with. Create users first.</p>';
-  const panel = el(`<div class="modal small" role="dialog" aria-modal="true">
-    <div class="overlay-head"><span class="overlay-title">Share “${esc(name)}”</span><span class="spacer"></span><button class="btn ghost" data-x>Close ✕</button></div>
-    <div class="confirm-body"><p class="stat-note">Owner <b>${esc(owner)}</b> always has access. Pick who else can see and use it (they cannot delete it).</p><div class="access-list">${rows}</div><div class="form-error" id="acc-err"></div></div>
-    <div class="confirm-actions"><button class="btn ghost" data-x>Cancel</button><button class="btn primary" data-save>Save access</button></div>
+  const panel = el(`<div class="modal small" role="dialog" aria-modal="true" aria-label="Rename ${esc(name)}">
+    <div class="overlay-head"><span class="overlay-title">Rename “${esc(m?.displayName || name)}”</span><span class="spacer"></span><button class="btn ghost" data-x>Close ✕</button></div>
+    <div class="confirm-body">
+      <label class="field-label" for="rn-input">Display name <span class="stat-note">(blank = use the machine ID)</span></label>
+      <input class="input" id="rn-input" type="text" maxlength="64" autocomplete="off" spellcheck="false" placeholder="${esc(name)}" value="${esc(current)}"/>
+      <p class="stat-note">The address <code>/m/${esc(name)}/</code> does not change — only the friendly name shown here.</p>
+      <div class="form-error" id="rn-err"></div>
+    </div>
+    <div class="confirm-actions"><button class="btn ghost" data-x>Cancel</button><button class="btn primary" data-save>Save</button></div>
   </div>`);
   modal.appendChild(panel);
   document.body.appendChild(modal);
   const close = () => { closeDialog(modal); modal.remove(); };
   panel.querySelectorAll('[data-x]').forEach((b) => b.addEventListener('click', close));
+  const save = async () => {
+    const dn = panel.querySelector('#rn-input').value;
+    const res = await api.patch(`/api/machines/${encodeURIComponent(name)}/rename`, { displayName: dn });
+    if (res.handled) { close(); return; }
+    if (!res.ok) { panel.querySelector('#rn-err').textContent = friendlyError(res.data, 'Rename failed'); return; }
+    close();
+    toast('ok', res.data.displayName ? `Renamed to “${res.data.displayName}”` : 'Reset to the default name');
+    store.requestPoll?.();
+  };
+  panel.querySelector('[data-save]').addEventListener('click', save);
+  panel.querySelector('#rn-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); save(); } });
+  openDialog(modal, { initialFocus: '#rn-input' });
+}
+
+// ---- Change access — avatar-chip multi-select ------------------------------
+// Selected people show as removable chips; "+ Add people" opens a dropdown of
+// the rest. The dropdown collapses on outside-click and on select.
+async function openAccessModal(name) {
+  const m = machineByName(name);
+  const [usersRes, accessRes] = await Promise.all([api.get('/api/users'), api.get(`/api/machines/${encodeURIComponent(name)}/access`)]);
+  if (usersRes.handled || accessRes.handled) return;
+  if (!usersRes.ok || !accessRes.ok) { toast('err', friendlyError(usersRes.data || accessRes.data, 'Could not load access')); return; }
+  const owner = accessRes.data.owner;
+  const all = usersRes.data.users.filter((u) => u.username !== owner && !u.disabled && u.role !== 'admin').map((u) => u.username);
+  const selected = new Set(accessRes.data.sharedWith || []);
+  const av = (u) => `<span class="ms-av">${esc((u[0] || '?').toUpperCase())}</span>`;
+
+  const modal = el('<div class="overlay" data-overlay></div>');
+  const panel = el(`<div class="modal small" role="dialog" aria-modal="true" aria-label="Access for ${esc(name)}">
+    <div class="overlay-head"><span class="overlay-title">Who can view “${esc(m?.displayName || name)}”</span><span class="spacer"></span><button class="btn ghost" data-x>Close ✕</button></div>
+    <div class="confirm-body">
+      <p class="stat-note">Owner <b>${esc(owner)}</b> always has access. Add people who can view &amp; use it — they cannot delete it.</p>
+      <div class="ms" id="ms"></div>
+      <div class="form-error" id="acc-err"></div>
+    </div>
+    <div class="confirm-actions"><button class="btn ghost" data-x>Cancel</button><button class="btn primary" data-save>Save access</button></div>
+  </div>`);
+  modal.appendChild(panel);
+  document.body.appendChild(modal);
+  const ms = panel.querySelector('#ms');
+  let dropOpen = false;
+
+  function render() {
+    const chips = selected.size
+      ? [...selected].map((u) => `<span class="ms-chip">${av(u)}<span>${esc(u)}</span><button class="ms-x" data-rm="${esc(u)}" aria-label="Remove ${esc(u)}">×</button></span>`).join('')
+      : '<span class="ms-none">No one yet — owner only.</span>';
+    const avail = all.filter((u) => !selected.has(u));
+    const drop = dropOpen ? `<div class="ms-drop" role="listbox">${
+      avail.length ? avail.map((u) => `<button class="ms-opt" role="option" type="button" data-add="${esc(u)}">${av(u)}<span>${esc(u)}</span></button>`).join('')
+                   : '<div class="ms-empty">Everyone is already added</div>'
+    }</div>` : '';
+    ms.innerHTML = `<div class="ms-chips">${chips}<button class="ms-add" type="button" ${all.length ? '' : 'disabled'}>+ Add people</button></div>${drop}`;
+  }
+  ms.addEventListener('click', (e) => {
+    const rm = e.target.closest('[data-rm]');
+    if (rm) { selected.delete(rm.dataset.rm); dropOpen = false; render(); return; }
+    const add = e.target.closest('[data-add]');
+    if (add) { selected.add(add.dataset.add); dropOpen = false; render(); return; } // collapse on select
+    if (e.target.closest('.ms-add')) { dropOpen = !dropOpen; render(); }
+  });
+  // Collapse the dropdown on any click outside the multi-select.
+  const onDoc = (e) => { if (dropOpen && !ms.contains(e.target)) { dropOpen = false; render(); } };
+  document.addEventListener('mousedown', onDoc, true);
+
+  const close = () => { document.removeEventListener('mousedown', onDoc, true); closeDialog(modal); modal.remove(); };
+  panel.querySelectorAll('[data-x]').forEach((b) => b.addEventListener('click', close));
   panel.querySelector('[data-save]').addEventListener('click', async () => {
-    const sel = [...panel.querySelectorAll('input[type=checkbox]:checked')].map((c) => c.value);
-    const res = await api.put(`/api/machines/${encodeURIComponent(name)}/access`, { sharedWith: sel });
+    const res = await api.put(`/api/machines/${encodeURIComponent(name)}/access`, { sharedWith: [...selected] });
     if (res.handled) { close(); return; }
     if (!res.ok) { panel.querySelector('#acc-err').textContent = friendlyError(res.data, 'Save failed'); return; }
-    close(); toast('ok', `Access updated for ${name}`); store.requestPoll?.();
+    close(); toast('ok', `Access updated for ${m?.displayName || name}`); store.requestPoll?.();
   });
-  openDialog(modal, { initialFocus: '[data-save]' });
+  render();
+  openDialog(modal, { initialFocus: '.ms-add' });
 }
