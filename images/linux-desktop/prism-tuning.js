@@ -1,33 +1,27 @@
-/* PRISM Virtual Desktop — smoothness defaults.
+/* PRISM Virtual Desktop — smoothness default.
  *
- * KasmVNC reads its stream settings from localStorage (per browser). A browser
- * that connected to an older build keeps stale, conservative values (e.g. 24 fps,
- * 960x540 video downscale) that make the desktop feel sluggish. This seeds a
- * smooth, crisp profile ONCE per version — it runs before the client reads its
- * settings, and sets a version marker so a user's later manual tweaks are kept.
+ * KasmVNC's stream settings live in localStorage (per browser) and are DERIVED
+ * from a master "video quality" preset (0=Static, 1=Low, 2=Medium, 3=High,
+ * 4=Extreme). The stock default is Medium → 24 fps and video downscaled to
+ * 960x540, which feels sluggish. On connect the client recomputes framerate /
+ * resolution / quality FROM the preset, so seeding those derived keys is futile;
+ * the preset is the only lever that sticks.
  *
- * Costs are bounded: KasmVNC only encodes changed regions, so a static desktop
- * at 60 fps costs almost nothing; the higher rate/quality only spends the CPU
- * that the removed webcam busy-loop freed up, during actual motion.
+ * We seed the Extreme preset ONCE per version (60 fps, 1920x1080 video, crisp
+ * quality floor). A version marker means a user's later manual change is kept.
+ * The server is already provisioned for this (Xvnc -FrameRate 60,
+ * -MaxVideoResolution 1920x1080), and KasmVNC only encodes changed regions, so
+ * a static desktop still costs ~nothing — the higher ceiling only spends the
+ * CPU the removed webcam busy-loop freed, during actual motion.
  */
 (function () {
   'use strict';
-  var VERSION = 'prism-smooth-v1';
+  var VERSION = 'prism-smooth-v2';
   try {
     if (localStorage.getItem('prism_tuned') === VERSION) return;
-    var tuned = {
-      framerate: '60',              // fluid motion (server ceiling is 60)
-      dynamic_quality_min: '7',     // hold a crisp floor instead of dropping to mush
-      dynamic_quality_max: '9',
-      treat_lossless: '8',
-      jpeg_video_quality: '7',
-      webp_video_quality: '7',
-      max_video_resolution_x: '1920', // do not downscale motion regions (crisp)
-      max_video_resolution_y: '1080',
-      enable_webp: 'true',
-      enable_threading: 'true',
-    };
-    for (var k in tuned) { if (Object.prototype.hasOwnProperty.call(tuned, k)) localStorage.setItem(k, tuned[k]); }
+    localStorage.setItem('video_quality', '4');   // Extreme — master preset
+    localStorage.setItem('enable_webp', 'true');   // efficient codec
+    localStorage.setItem('enable_threading', 'true');
     localStorage.setItem('prism_tuned', VERSION);
-  } catch (e) { /* private mode / storage disabled — client falls back to its defaults */ }
+  } catch (e) { /* private mode / storage disabled — client keeps its defaults */ }
 })();
