@@ -18,6 +18,7 @@ import { ensureDataDir, ensureSecret } from './lib/store.js';
 import { UserStore } from './lib/users.js';
 import { SessionStore } from './lib/sessions.js';
 import { ShareStore } from './lib/shares.js';
+import { MachineMetaStore } from './lib/machineMeta.js';
 import { UsageStore } from './lib/usage.js';
 import { MetricsStore, deriveAlerts } from './lib/metrics.js';
 import { AuditLog } from './lib/audit.js';
@@ -74,7 +75,7 @@ function fatalExit(detail, { sync = false } = {}) {
 const SECRET = ensureSecret(path.join(DATA_DIR, 'secret'));
 // A corrupt/unreadable store throws here — at BOOT, before the runtime crash-net
 // is armed. Catch it so the failure is tagged + alerted, not a silent loop.
-let users, sessions, shares, usage, metrics;
+let users, sessions, shares, usage, metrics, machineMeta;
 try {
   users = new UserStore(path.join(DATA_DIR, 'users.json')).load();
   sessions = new SessionStore(path.join(DATA_DIR, 'sessions.json'), SECRET, {
@@ -83,6 +84,7 @@ try {
     idleMs: config.sessionIdleHours * 60 * 60 * 1000,
   }).load();
   shares = new ShareStore(path.join(DATA_DIR, 'machines.json')).load();
+  machineMeta = new MachineMetaStore(path.join(DATA_DIR, 'machine-meta.json')).load();
   usage = new UsageStore(path.join(DATA_DIR, 'usage.json')).load();
   metrics = new MetricsStore(path.join(DATA_DIR, 'metrics.json')).load();
 } catch (e) {
@@ -416,6 +418,8 @@ async function getState(user) {
     const machines = filterMachinesForUser(cards, user, sharedNames).map((c) => {
       const access = machineAccess(user, c, sharedNames);
       const decorated = { ...c, access };
+      const dn = machineMeta.displayName(c.name);
+      if (dn) decorated.displayName = dn;
       if (user.role === 'admin') decorated.sharedWith = shares.listFor(c.name);
       if (browserSessions.has(c.name)) decorated.browserActive = true;
       return decorated;
@@ -438,7 +442,9 @@ async function getState(user) {
     lastMachines = cards;
     // Prune shares whose machine no longer exists — ONLY on the trustworthy
     // fresh path (never from stale/empty state).
-    shares.sweep(new Set(cards.map((c) => c.name))).catch(() => {});
+    const liveNames = new Set(cards.map((c) => c.name));
+    shares.sweep(liveNames).catch(() => {});
+    machineMeta.sweep(liveNames).catch(() => {});
     return wrap(cards, false, true);
   } catch (e) {
     if (e instanceof DockerDownError) return wrap(lastMachines, true, false);
@@ -647,6 +653,7 @@ async function deleteMachine(user, name, confirm) {
     dropBrowserSession(name);
     if (!ok) return { status: 500, body: { error: { code: 'DOCKER_CLI_ERROR', message: 'delete failed' } } };
     await shares.removeMachine(name); // drop its access list
+    await machineMeta.removeMachine(name); // drop its display name
     return { status: 200, body: { ok: true } };
   } finally {
     inFlight.delete(name);
@@ -948,6 +955,20 @@ async function putAccess(name, sharedWith) {
   }
   const list = await shares.setList(name, sharedWith);
   return { status: 200, body: { ok: true, sharedWith: list } };
+}
+
+// ---- Rename (display name) — owner or admin --------------------------------
+// The container NAME (the proxy URL /m/<name>/) never changes; this sets only a
+// friendly label shown in the UI. Shared viewers cannot rename.
+async function renameMachine(user, name, displayName) {
+  if (typeof displayName !== 'string') return { status: 400, body: { error: { code: 'VALIDATION', message: 'displayName must be a string' } } };
+  if (displayName.length > 64) return { status: 400, body: { error: { code: 'VALIDATION', message: 'name too long (max 64 characters)' } } };
+  const resolved = await resolveMachine(user, name, 'use');
+  if (resolved.error) return resolved.error;
+  if (!canDelete(resolved.access)) return { status: 403, body: { error: { code: 'FORBIDDEN', message: 'Only the owner or an admin can rename this machine.' } } };
+  const stored = await machineMeta.setDisplayName(name, displayName);
+  invalidateMachineCache();
+  return { status: 200, body: { ok: true, displayName: stored } };
 }
 
 // ---- Colima transitions (admin only, enforced at route) --------------------
@@ -1328,6 +1349,16 @@ const server = http.createServer(async (req, res) => {
       }
     }
 
+    // ---- Rename (display name) — owner or admin, enforced in renameMachine --
+    if ((m = rawPath.match(/^\/api\/machines\/([^/]+)\/rename$/)) && method === 'PATCH') {
+      const name = decodeURIComponent(m[1]);
+      const body = await readJson(req);
+      if (!body) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON' } });
+      const out = await renameMachine(auth.user, name, body.displayName ?? '');
+      if (out.status === 200) recordAudit(req, auth.user.username, 'machine.rename', name, { displayName: out.body.displayName });
+      return sendJson(res, out.status, out.body);
+    }
+
     // ---- VM control (admin only) -----------------------------------------
     if ((rawPath === '/api/vm/start' || rawPath === '/api/vm/stop') && method === 'POST') {
       if (!isAdmin(auth)) return forbidden(res);
@@ -1494,7 +1525,7 @@ async function handleDeleteUser(req, res, auth, target) {
     for (const c of cards.filter((c) => c.owner === target && !PROTECTED_NAMES.has(c.name))) {
       inFlight.add(c.name);
       try {
-        if (await rmContainer(c.name)) { deleted.push(c.name); await shares.removeMachine(c.name); }
+        if (await rmContainer(c.name)) { deleted.push(c.name); await shares.removeMachine(c.name); await machineMeta.removeMachine(c.name); }
         else failed.push({ name: c.name, error: 'rm failed' });
       } finally { inFlight.delete(c.name); }
     }
