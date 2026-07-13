@@ -134,7 +134,9 @@
         <button class="btn ghost" id="viewer-close">Close ✕</button>
       </div>
       <div id="viewer-tip" class="viewer-tip hidden"></div>
-      <iframe id="viewer-frame" class="viewer-frame" allow="clipboard-read; clipboard-write"></iframe>
+      <!-- allow must grant autoplay (desktop speaker audio) + microphone (mic input);
+           without them the browser blocks KasmVNC audio in/out inside this iframe. -->
+      <iframe id="viewer-frame" class="viewer-frame" allow="autoplay; microphone; clipboard-read; clipboard-write"></iframe>
     </div>
   </div>
 
