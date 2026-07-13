@@ -77,13 +77,21 @@
   var btn;
   function render() {
     if (!btn) return;
-    var label = state === 'on' ? '🎤 Mic on' : state === 'connecting' ? '🎤 …' : '🎙️ Mic off';
+    var label = state === 'on' ? '🎤 Mic ON — click to mute'
+      : state === 'connecting' ? '🎙️ Starting mic…'
+      : '🎙️ Enable microphone';
     btn.textContent = label;
     btn.setAttribute('aria-pressed', state === 'on' ? 'true' : 'false');
-    btn.style.background = state === 'on' ? '#e5544b' : 'rgba(30,34,44,.85)';
-    btn.title = state === 'on' ? 'Microphone is live — click to mute' : 'Enable microphone in this desktop';
+    btn.style.background = state === 'on' ? '#e5544b' : 'var(--prism-mic-off,#2f6fed)';
+    btn.style.animation = state === 'off' ? 'prismMicPulse 2.2s ease-in-out infinite' : 'none';
+    btn.title = state === 'on'
+      ? 'Your microphone is live in this desktop — click to mute'
+      : 'Click to use your computer’s microphone in this desktop (your browser will ask permission)';
   }
   function mount() {
+    var st = document.createElement('style');
+    st.textContent = '@keyframes prismMicPulse{0%,100%{box-shadow:0 4px 14px rgba(0,0,0,.35),0 0 0 0 rgba(47,111,237,.5)}50%{box-shadow:0 4px 14px rgba(0,0,0,.35),0 0 0 6px rgba(47,111,237,0)}}';
+    document.head.appendChild(st);
     btn = document.createElement('button');
     btn.id = 'prism-mic-btn';
     btn.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483000;'
