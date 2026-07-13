@@ -1,7 +1,8 @@
 /* PRISM Virtual Desktop — microphone (audio input).
  *
  * The OSS KasmVNC client cannot send the mic; only Kasm Workspaces can. We add
- * it: capture the browser mic, encode raw s16le PCM (mono), and stream it over a
+ * it: capture the browser mic as raw float32le PCM (mono — the format KasmVNC's
+ * virtual_mic pipe-source uses) and stream it over a
  * WebSocket to KasmVNC's audio-input server (container :4903), which the panel
  * proxies at <base>kasmmic?sample_rate=<N>. The server then creates a
  * `virtual_mic` PulseAudio source and sets it default, so desktop apps hear it.
@@ -51,13 +52,10 @@
       node = ctx.createScriptProcessor(4096, 1, 1);
       node.onaudioprocess = function (e) {
         if (!ws || ws.readyState !== 1) return;
-        var f = e.inputBuffer.getChannelData(0);
-        var pcm = new Int16Array(f.length);
-        for (var i = 0; i < f.length; i++) {
-          var s = f[i] < -1 ? -1 : f[i] > 1 ? 1 : f[i];
-          pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-        }
-        try { ws.send(pcm.buffer); } catch (x) {}
+        // KasmVNC creates the virtual_mic pipe-source as float32le mono, and Web
+        // Audio already gives float32 samples — send them raw (a copy, since the
+        // internal buffer is reused between callbacks).
+        try { ws.send(new Float32Array(e.inputBuffer.getChannelData(0)).buffer); } catch (x) {}
       };
       // ScriptProcessor only fires while connected to the graph; route through a
       // muted gain node so nothing is echoed back to the local speakers.
