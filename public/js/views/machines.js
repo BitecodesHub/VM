@@ -484,7 +484,9 @@ export function handleMachineClick(e) {
   if (!name) return;
   const act = btn.dataset.act;
   const m = machineByName(name);
-  if (act === 'open') openViewer(m);
+  // For a Selenium node, "Open UI" with no live browser would show the empty
+  // Grid splash — auto-launch Chrome/Firefox first so the browser always appears.
+  if (act === 'open') { if (m.webdriver && !m.browserActive) doBrowser(name); else openViewer(m); }
   else if (act === 'browser') doBrowser(name);
   else if (act === 'browser-close') doBrowserClose(name);
   else if (act === 'logs') openLogs(name);
