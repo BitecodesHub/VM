@@ -428,7 +428,7 @@ async function doDelete(name) {
 
 // ---- Viewer ----------------------------------------------------------------
 function openViewer(m) {
-  $('#viewer-title').textContent = m.name;
+  $('#viewer-title').textContent = m.displayName || m.name;
   const hint = $('#viewer-hint'); const tip = $('#viewer-tip');
   if (m.passwordHint) {
     hint.textContent = `VNC password: ${m.passwordHint}`; hint.classList.remove('hidden');
@@ -442,15 +442,11 @@ function openViewer(m) {
     tip.innerHTML = `This is a test-browser node — the screen is empty until a browser runs. Use <b>Open browser</b> on the card, or point WebDriver tests at <b>http://${esc(host)}:${m.webdriver.port}</b>.`;
     tip.classList.remove('hidden');
   } else { hint.classList.add('hidden'); tip.classList.add('hidden'); }
+  // No screen-fit control: the template URL is authoritative (desktops =
+  // resize=remote so they always fill the window; nodes = scale/fit).
   const url = machineUrl(m);
-  const sel = $('#viewer-resize');
-  const applyResize = (mode) => { const u = url.replace(/resize=(scale|off|remote)/, `resize=${mode}`); $('#viewer-newtab').href = u; $('#viewer-frame').src = u; };
-  if (sel) {
-    const cur = (url.match(/resize=(scale|off|remote)/) || [])[1] || 'scale';
-    sel.value = cur;
-    sel.onchange = () => applyResize(sel.value);
-  }
-  applyResize(sel ? sel.value : 'scale');
+  $('#viewer-newtab').href = url;
+  $('#viewer-frame').src = url;
   openDialog($('#viewer'), { initialFocus: '#viewer-close' });
 }
 export function closeViewer() { closeDialog($('#viewer')); $('#viewer-frame').src = 'about:blank'; }

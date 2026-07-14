@@ -16,6 +16,19 @@
  */
 (function () {
   'use strict';
+
+  // Always fill the window (remote resize) — no letterboxing, no fixed 1024x768.
+  // Old links/bookmarks may still carry resize=scale, so rewrite the URL on
+  // EVERY load before the client reads it, and pin the persisted setting too.
+  // This runs ahead of the KasmVNC bundle (script order in vnc.html).
+  try {
+    if (/[?&]resize=(scale|off)\b/.test(location.search)) {
+      var q = location.search.replace(/([?&]resize=)(scale|off)\b/, '$1remote');
+      history.replaceState(null, '', location.pathname + q + location.hash);
+    }
+    localStorage.setItem('resize', 'remote');
+  } catch (e) { /* storage/history unavailable — template URLs still carry remote */ }
+
   var VERSION = 'prism-smooth-v2';
   try {
     if (localStorage.getItem('prism_tuned') === VERSION) return;

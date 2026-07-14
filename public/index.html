@@ -124,13 +124,8 @@
         <span id="viewer-title" class="overlay-title"></span>
         <span id="viewer-hint" class="pw-chip hidden"></span>
         <span class="spacer"></span>
-        <label class="viewer-res"><span class="sr-only">Screen fit</span>
-          <select id="viewer-resize" class="select" aria-label="Screen fit">
-            <option value="scale">Fit to window</option>
-            <option value="off">Actual size</option>
-            <option value="remote">Resize desktop</option>
-          </select>
-        </label>
+        <!-- No screen-fit control: desktops always fill the window (remote resize);
+             Selenium nodes always fit-to-window (their VNC cannot resize). -->
         <a id="viewer-newtab" class="btn ghost" target="_blank" rel="noopener">Open in new tab ↗</a>
         <button class="btn ghost" id="viewer-close">Close ✕</button>
       </div>
