@@ -71,6 +71,13 @@ RUN mkdir -p /home/kasm-user/.mozilla/firefox/prism.default \
 
 # Liveness: KasmVNC serves HTTPS on 6901 (answers 401 until Basic auth, which
 # still proves it is up — so any response is success, no response is wedged).
+# Passwordless sudo. The kasm-user account ships LOCKED (no password set), so
+# without this rule the user can never `sudo` — apt installs fail with an
+# unsatisfiable "[sudo] password for kasm-user" prompt. Standard for a
+# single-user disposable desktop.
+RUN echo 'kasm-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kasm-user-nopasswd \
+ && chmod 0440 /etc/sudoers.d/kasm-user-nopasswd
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
   CMD curl -sk https://localhost:6901/ -o /dev/null || exit 1
 

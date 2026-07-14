@@ -69,6 +69,13 @@ RUN mkdir -p /home/kasm-user/.mozilla/firefox/prism.default \
  && printf 'user_pref("gfx.webrender.software", true);\nuser_pref("gfx.canvas.accelerated", false);\nuser_pref("layers.acceleration.disabled", true);\nuser_pref("webgl.disabled", true);\nuser_pref("browser.shell.checkDefaultBrowser", false);\nuser_pref("datareporting.policy.dataSubmissionEnabled", false);\nuser_pref("browser.aboutwelcome.enabled", false);\nuser_pref("toolkit.telemetry.reportingpolicy.firstRun", false);\n' > /home/kasm-user/.mozilla/firefox/prism.default/user.js \
  && chown -R 1000:1000 /home/kasm-user/.mozilla
 
+# Passwordless sudo. The kasm-user account ships LOCKED (no password set), so
+# without this rule the user can never `sudo` — apt installs fail with an
+# unsatisfiable "[sudo] password for kasm-user" prompt. Standard for a
+# single-user disposable desktop.
+RUN echo 'kasm-user ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/kasm-user-nopasswd \
+ && chmod 0440 /etc/sudoers.d/kasm-user-nopasswd
+
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
   CMD curl -sk https://localhost:6901/ -o /dev/null || exit 1
 
