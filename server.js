@@ -872,6 +872,9 @@ async function openBrowserSession(user, name) {
       const msg = created.json?.value?.message || `WebDriver answered ${created.status}`;
       return { status: 502, body: { error: { code: 'WEBDRIVER_ERROR', message: String(msg).slice(0, 200) } } };
     }
+    // Fill the node's 1920x1080 screen — the browser opens small by default.
+    // W3C window/rect works for both Chrome and Firefox (unlike --start-maximized).
+    await wdFetch(card.webdriver.port, 'POST', `/session/${sessionId}/window/rect`, { x: 0, y: 0, width: 1920, height: 1080 }, 10_000).catch(() => {});
     // Show something useful immediately (best effort — the window exists regardless).
     await wdFetch(card.webdriver.port, 'POST', `/session/${sessionId}/url`, { url: WD_START_PAGE }, 20_000).catch(() => {});
 
