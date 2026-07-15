@@ -32,6 +32,24 @@ RUN install -d -m 0755 /etc/apt/keyrings \
   && apt-get update && apt-get install -y --no-install-recommends firefox \
   && rm -rf /var/lib/apt/lists/*
 
+# Chromium — Chrome's open-source base (same Blink engine, DevTools, Google
+# sign-in). Google Chrome ships amd64-only and cannot run on this arm64 host, and
+# Ubuntu's own chromium-browser package is a snap that will not run in a container
+# (the same reason Firefox comes from Mozilla's apt repo above). The xtradeb PPA
+# provides a real, non-snap arm64 .deb built for Ubuntu Noble. It is launched with
+# --no-sandbox because the desktop runs as uid 1000 without CAP_SYS_ADMIN — the
+# disposable container is itself the isolation boundary. A PATH-priority wrapper
+# plus a patched .desktop entry apply the flags to both the terminal command and
+# the application-menu launcher.
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends software-properties-common \
+  && add-apt-repository -y ppa:xtradeb/apps \
+  && apt-get update && apt-get install -y --no-install-recommends chromium \
+  && rm -rf /var/lib/apt/lists/* \
+  && printf '#!/bin/bash\nexec /usr/bin/chromium --no-sandbox --disable-gpu --password-store=basic "$@"\n' > /usr/local/bin/chromium \
+  && chmod +x /usr/local/bin/chromium \
+  && sed -i -E 's#^Exec=/usr/bin/chromium#Exec=/usr/bin/chromium --no-sandbox --disable-gpu --password-store=basic#' /usr/share/applications/chromium.desktop
+
 # Rebrand the KasmVNC web client so it never shows "Kasm" to users: retitle,
 # replace the visible product name with PRISM, and blank the Kasm logo/favicon
 # assets. Only display strings + images are touched — internal identifiers and
