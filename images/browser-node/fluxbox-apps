@@ -1,0 +1,7 @@
+# Kiosk: every window undecorated and maximized — a browser node's screen
+# should only ever show the browser, never the bare desktop or WM chrome.
+# (Windows here are only ever the WebDriver-launched browser and its popups.)
+[app] (class=.*)
+  [Deco]      {NONE}
+  [Maximized] {yes}
+[end]

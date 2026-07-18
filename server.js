@@ -863,7 +863,13 @@ async function openBrowserSession(user, name) {
   if (existing) {
     try {
       const r = await wdFetch(existing.wdPort, 'GET', `/session/${existing.sessionId}/url`, undefined, 5000);
-      if (r.status === 200) return { status: 200, body: { ok: true, sessionId: existing.sessionId, reused: true } };
+      if (r.status === 200) {
+        // Re-assert the full-screen rect on every reopen: per W3C, Set Window
+        // Rect first RESTORES the window, so a browser minimized by a script
+        // un-minimizes instead of leaving the viewer on the bare desktop.
+        await wdFetch(existing.wdPort, 'POST', `/session/${existing.sessionId}/window/rect`, { x: 0, y: 0, width: 1920, height: 1080 }, 10_000).catch(() => {});
+        return { status: 200, body: { ok: true, sessionId: existing.sessionId, reused: true } };
+      }
     } catch { /* fall through and recreate */ }
     dropBrowserSession(name);
   }

@@ -1,0 +1,4 @@
+# Intentionally empty. The stock fluxbox bindings included `Mod1 F9 :Minimize`
+# (plus Close/Maximize/workspace keys), which let users minimize the browser
+# onto the empty Selenium desktop. A kiosk browser node needs no window-manager
+# shortcuts at all — every keystroke belongs to the browser.
