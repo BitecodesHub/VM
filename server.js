@@ -415,6 +415,9 @@ async function getState(user) {
   const sharedNames = sharedSetFor(user);
 
   const wrap = (cards, stale, dockerReachable) => {
+    // A non-running node cannot hold a live browser window — evict its session
+    // immediately (fresh data only) so cards never advertise a dead browser.
+    if (!stale) for (const c of cards) if (c.state !== 'running' && browserSessions.has(c.name)) dropBrowserSession(c.name);
     const machines = filterMachinesForUser(cards, user, sharedNames).map((c) => {
       const access = machineAccess(user, c, sharedNames);
       const decorated = { ...c, access };
@@ -783,7 +786,9 @@ async function deleteMachineFile(user, name, filename) {
 // "Open browser" starts a real WebDriver session so the node's screen shows an
 // actual browser window instead of an empty desktop. Selenium standalone reaps
 // idle sessions after ~300s, so each open session gets a keep-alive ping every
-// 120s (a session command resets the idle timer). The session ids are PERSISTED
+// 45s (a session command resets the idle timer; the short interval also detects
+// a died browser fast, so cards do not advertise a stale "browser running" —
+// the Grid-splash-instead-of-Chrome bug). The session ids are PERSISTED
 // (data/browser-sessions.json) and re-attached on boot, so a panel restart no
 // longer orphans a live browser window.
 const browserSessions = new Map(); // name -> { sessionId, wdPort, timer, startedAt }
@@ -806,7 +811,7 @@ function keepAliveTimer(name, wdPort, sessionId) {
   const timer = setInterval(async () => {
     try { const p = await wdFetch(wdPort, 'GET', `/session/${sessionId}/url`, undefined, 10_000); if (p.status !== 200) dropBrowserSession(name); }
     catch { dropBrowserSession(name); }
-  }, 120_000);
+  }, 45_000);
   timer.unref?.();
   return timer;
 }

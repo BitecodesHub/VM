@@ -224,7 +224,10 @@ function renderCard(m, showOwner) {
     // Under the HTTPS front, a fresh tab hits the machine origin directly — if the
     // internal CA isn't trusted the browser shows a cert warning; hint at it.
     const newTabTitle = store.state?.panel?.tls ? 'Opens the screen on its own HTTPS origin (accept the certificate once if prompted)' : 'Open the screen in a new browser tab';
-    row.appendChild(el(`<a class="btn" href="${esc(abs)}" target="_blank" rel="noopener" title="${esc(newTabTitle)}">Open in new tab ↗</a>`));
+    // Browser nodes: ensure a live Chrome/Firefox window as the tab opens (the
+    // click handler fires the idempotent ensure-browser call in the background),
+    // so a direct viewer link never lands on the bare Selenium desktop.
+    row.appendChild(el(`<a class="btn" href="${esc(abs)}" target="_blank" rel="noopener" ${m.webdriver ? `data-ensure-browser="${esc(m.name)}"` : ''} title="${esc(newTabTitle)}">Open in new tab ↗</a>`));
     row.appendChild(el(`<button class="copy-btn" data-copy="${esc(abs)}" title="Copy link" aria-label="Copy link"><span class="ico">${ICONS.copy}</span></button>`));
     if (m.webdriver) {
       const host = m.webdriver.lan ? location.hostname : '127.0.0.1';
@@ -388,10 +391,13 @@ async function doBrowser(name) {
     const res = await api.post(`/api/machines/${encodeURIComponent(name)}/browser`);
     if (res.handled) return;
     if (res.ok) {
-      toast('ok', `Browser opened on ${name}`);
+      // Reused = the browser was already live; only announce a fresh launch.
+      if (!res.data?.reused) toast('ok', `Browser opened on ${name}`);
       store.requestPoll?.();
       const m = machineByName(name);
-      if (m) openViewer(m);
+      // The store has not re-polled yet, so force the flag — the browser is
+      // provably live — to keep the "screen is empty" tip from flashing.
+      if (m) openViewer({ ...m, browserActive: true });
     } else {
       toast('err', friendlyError(res.data, 'Could not open a browser on this node'));
     }
@@ -468,6 +474,11 @@ export function closeLogs() { closeDialog($('#logs')); logsName = null; }
 export function handleMachineClick(e) {
   const copyBtn = e.target.closest('[data-copy]');
   if (copyBtn) { copyText(copyBtn.dataset.copy); return; }
+  // "Open in new tab" on a browser node: fire the idempotent ensure-browser
+  // call in the background and let the link open naturally — by the time the
+  // viewer connects, Chrome/Firefox is up (never the bare Selenium desktop).
+  const ensure = e.target.closest('a[data-ensure-browser]');
+  if (ensure) { api.post(`/api/machines/${encodeURIComponent(ensure.dataset.ensureBrowser)}/browser`).catch(() => {}); return; }
   const tile = e.target.closest('.tile[data-category]');
   if (tile) {
     if (tile.getAttribute('aria-disabled') === 'true') { toast('info', store.state?.quota && store.state.quota.used >= store.state.quota.limit ? 'Machine limit reached. Stop or delete one first.' : 'Unavailable right now.'); return; }
@@ -480,9 +491,11 @@ export function handleMachineClick(e) {
   if (!name) return;
   const act = btn.dataset.act;
   const m = machineByName(name);
-  // For a Selenium node, "Open UI" with no live browser would show the empty
-  // Grid splash — auto-launch Chrome/Firefox first so the browser always appears.
-  if (act === 'open') { if (m.webdriver && !m.browserActive) doBrowser(name); else openViewer(m); }
+  // For a Selenium node, ALWAYS route "open" through the idempotent ensure-
+  // browser call: browserActive is poll-cached and can be stale (browser died,
+  // node restarted), which used to land users on the bare Selenium desktop.
+  // A live session is simply reused, so the extra round-trip is cheap.
+  if (act === 'open') { if (m.webdriver) doBrowser(name); else openViewer(m); }
   else if (act === 'browser') doBrowser(name);
   else if (act === 'browser-close') doBrowserClose(name);
   else if (act === 'logs') openLogs(name);
