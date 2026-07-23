@@ -20,6 +20,7 @@ import { SessionStore } from './lib/sessions.js';
 import { ShareStore } from './lib/shares.js';
 import { MachineMetaStore } from './lib/machineMeta.js';
 import { UsageStore } from './lib/usage.js';
+import { UsageSessionStore } from './lib/usage-sessions.js';
 import { MetricsStore, deriveAlerts } from './lib/metrics.js';
 import { AuditLog } from './lib/audit.js';
 import { sweepStale } from './lib/tmpsweep.js';
@@ -93,6 +94,18 @@ try {
 // Append-only audit trail (privileged actions). Not in the try block — a bad
 // audit file must never block boot; it self-heals on the next trim.
 const audit = new AuditLog(path.join(DATA_DIR, 'audit.jsonl'));
+// Per-user × per-machine session ledger (who used which machine, for how long).
+// Outside the try + load wrapped: a corrupt checkpoint must never block boot —
+// worst case we start with no live sessions, which reconcile() treats as ended.
+const usageSessions = new UsageSessionStore(
+  path.join(DATA_DIR, 'usage-sessions.jsonl'),
+  path.join(DATA_DIR, 'usage-open.json'),
+);
+try { usageSessions.load(); } catch (e) { console.error(`[VMP_USAGE] ignoring corrupt open-session checkpoint — ${e?.message || e}`); }
+{
+  const orphaned = usageSessions.reconcile('panel_restart');
+  if (orphaned) console.error(`[VMP_USAGE] closed ${orphaned} orphaned session(s) left open by the previous process`);
+}
 // Real client IP behind the Caddy loopback front. Caddy appends the true client
 // IP to X-Forwarded-For; trust it ONLY when the immediate peer is loopback (the
 // reverse proxy), and take the RIGHTMOST hop (the one Caddy appended — a client
@@ -199,6 +212,8 @@ async function maintenanceTick() {
     });
     evaluateAlerts();
   } catch { /* sampling is best-effort */ }
+  // Heartbeat live usage sessions so a crash loses at most one tick of duration.
+  usageSessions.heartbeat();
 }
 setInterval(() => { maintenanceTick().catch(() => {}); }, 60_000).unref?.();
 
@@ -1656,9 +1671,11 @@ async function handleUpgrade(req, socket, head) {
     }
     socket._vmpUser = auth.user.username; // tag for revocation
     // Track an open screen connection so the idle reaper never stops a machine
-    // someone is actively viewing.
+    // someone is actively viewing, AND attribute usage to the CONNECTED user
+    // (ref-counted — screen + kasmaudio + kasmmic are separate upgrades).
     openMachineConn(parsed.name);
-    socket.once('close', () => closeMachineConn(parsed.name));
+    usageSessions.open(auth.user.username, parsed.name, { template: card.template, owner: card.owner, ip: clientIp(req) });
+    socket.once('close', () => { closeMachineConn(parsed.name); usageSessions.close(auth.user.username, parsed.name); });
     const route = proxyRoute(card, parsed);
     proxyUpgrade({ req, socket, head, port: route.port, target: route.target, upgradedSockets, maxSockets: config.maxUpgradedSockets, ...backendProxyOpts(card) });
   } catch {
@@ -1711,7 +1728,7 @@ async function shutdown() {
   for (const s of upgradedSockets) s.destroy();
   // AWAIT the debounced writes — otherwise a kickstart/SIGTERM drops up to ~30s
   // of session/usage/metrics data that was only scheduled to flush.
-  try { await Promise.allSettled([sessions.flush(), usage.flush(), metrics.flush()]); } catch { /* best-effort */ }
+  try { await Promise.allSettled([sessions.flush(), usage.flush(), usageSessions.flush(), metrics.flush()]); } catch { /* best-effort */ }
   logStream?.end();
   process.exit(0);
 }
