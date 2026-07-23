@@ -52,44 +52,112 @@ export function renderAdminView(root) {
   else renderMachines(root, { showCreate: true, title: admin ? 'My machines' : 'Your machines', ownerScope: admin ? store.user.username : null });
 }
 
-// ---- Usage & metrics tab (admin) -------------------------------------------
+// ---- Usage & analytics tab (admin) -----------------------------------------
+// Session-based analytics: WHO used WHICH machine and for HOW LONG, over a
+// selectable window. Host resource metrics stay below for capacity context.
+let usageDays = 30;
 function renderUsage(root) {
-  if (!root.querySelector('#usage-tbody')) {
+  if (!root.querySelector('#usage-analytics')) {
     root.innerHTML = '';
     const sec = el('<section class="admin-section"></section>');
-    sec.appendChild(el('<h2 class="section-title">Usage &amp; metrics</h2>'));
-    sec.appendChild(el('<div class="res-tiles" id="usage-tiles"></div>'));
-    sec.appendChild(el('<div class="chart-card"><div class="chart-title">Memory used — recent (per minute)</div><div class="chart-holder" id="usage-spark"></div></div>'));
-    sec.appendChild(el('<div class="table-wrap"><table class="table"><thead><tr><th>User</th><th>Machine-hours</th><th>By type</th><th>Last active</th></tr></thead><tbody id="usage-tbody"><tr><td colspan="4" class="stat-note">Loading…</td></tr></tbody></table></div>'));
+    const head = el('<div class="admin-head"></div>');
+    head.appendChild(el('<h2 class="section-title">Usage &amp; analytics</h2>'));
+    const range = el(`<select class="select" id="usage-range" style="max-width:170px">
+      <option value="7">Last 7 days</option>
+      <option value="30">Last 30 days</option>
+      <option value="90">Last 90 days</option>
+      <option value="365">Last 12 months</option>
+    </select>`);
+    range.value = String(usageDays);
+    range.addEventListener('change', () => { usageDays = parseInt(range.value, 10) || 30; loadUsage(root); });
+    head.appendChild(range);
+    sec.appendChild(head);
+    sec.appendChild(el('<div id="usage-analytics"><p class="stat-note">Loading…</p></div>'));
     root.appendChild(sec);
   }
   loadUsage(root);
 }
+function subTitle(t) { return `<h3 class="section-title" style="font-size:15px;margin:22px 0 8px">${esc(t)}</h3>`; }
+function humanDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60);
+  if (h) return `${h}h ${m}m`;
+  if (m) return `${m}m`;
+  return `${sec}s`;
+}
+function hoursBar(hours, max) {
+  const pct = Math.max(2, Math.min(100, Math.round((hours / (max || 1)) * 100)));
+  return `<div style="display:flex;align-items:center;gap:8px">
+    <span style="flex:0 0 52px;text-align:right">${hours}h</span>
+    <span style="flex:1;height:8px;border-radius:4px;background:var(--border);overflow:hidden;display:block">
+      <span style="display:block;height:100%;width:${pct}%;background:var(--accent);border-radius:4px"></span>
+    </span>
+  </div>`;
+}
+function dailyChart(daily) {
+  if (!daily.length) return '<p class="chart-empty">No usage in this range.</p>';
+  const W = 640, H = 80, n = daily.length;
+  const max = Math.max(1, ...daily.map((d) => d.hours));
+  const bw = W / n;
+  const bars = daily.map((d, i) => {
+    const bh = (d.hours / max) * (H - 4);
+    return `<rect x="${(i * bw).toFixed(1)}" y="${(H - bh).toFixed(1)}" width="${Math.max(1, bw - 1).toFixed(1)}" height="${bh.toFixed(1)}" fill="var(--accent)" rx="1"><title>${esc(d.date)}: ${d.hours}h</title></rect>`;
+  }).join('');
+  return `<svg class="chart-svg" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Daily usage hours">${bars}</svg>`;
+}
 async function loadUsage(root) {
-  const [u, m] = await Promise.all([api.get('/api/usage'), api.get('/api/metrics?points=120')]);
-  if (u.handled || m.handled || !root.querySelector('#usage-tbody')) return;
-  const tb = root.querySelector('#usage-tbody');
-  const owners = (u.ok && u.data.owners) || [];
-  if (!owners.length) tb.innerHTML = '<tr><td colspan="4" class="stat-note">No usage recorded yet.</td></tr>';
-  else {
-    tb.innerHTML = '';
-    for (const o of owners) {
-      const bt = Object.entries(o.byTemplate || {}).map(([k, v]) => `${esc(k)}: ${Math.round((v / 60) * 10) / 10}h`).join(', ');
-      tb.appendChild(el(`<tr><td>${esc(o.owner)}</td><td>${o.hours}</td><td class="stat-note">${bt}</td><td class="stat-note">${o.lastAt ? esc(new Date(o.lastAt).toLocaleString()) : '—'}</td></tr>`));
-    }
-  }
+  const holder = root.querySelector('#usage-analytics');
+  if (!holder) return;
+  const [a, m] = await Promise.all([api.get(`/api/analytics?days=${usageDays}`), api.get('/api/metrics?points=120')]);
+  if (a.handled || m.handled || !root.querySelector('#usage-analytics')) return;
+  if (!a.ok) { holder.innerHTML = `<p class="stat-note">${esc(friendlyError(a.data, 'Could not load analytics'))}</p>`; return; }
+  const d = a.data; const t = d.totals || {};
+  const tiles = [
+    ['Total time', `${t.hours || 0}h`, `over ${d.range?.days || usageDays} days`],
+    ['Active now', String(t.activeNow || 0), `${t.activeUsers || 0} user(s) online`],
+    ['Users', String(t.users || 0), 'with sessions'],
+    ['Machines', String(t.machines || 0), 'used'],
+    ['Avg session', humanDur(t.avgSessionSec || 0), `${t.sessions || 0} sessions`],
+    ['Peak concurrent', String(t.peakConcurrency || 0), 'sessions at once'],
+  ].map(([l, v, s]) => `<div class="res-tile"><div class="res-tile-label">${esc(l)}</div><div class="res-tile-value">${esc(v)}</div><div class="res-tile-sub">${esc(s)}</div></div>`).join('');
+
+  const active = d.active || [];
+  const activeRows = active.length
+    ? active.map((s) => `<tr><td>${esc(s.user)}</td><td class="mono">${esc(s.machine)}</td><td class="stat-note">${esc(s.template || '—')}</td><td>${humanDur(s.durationSec)}</td></tr>`).join('')
+    : '<tr><td colspan="4" class="stat-note">No one is connected right now.</td></tr>';
+
+  const maxUserH = Math.max(1, ...(d.byUser || []).map((u) => u.hours));
+  const userRows = (d.byUser || []).length
+    ? d.byUser.map((u) => `<tr><td>${esc(u.user)}</td><td>${hoursBar(u.hours, maxUserH)}</td><td>${u.sessions}</td><td>${u.machines}</td><td class="stat-note">${u.lastAt ? esc(new Date(u.lastAt).toLocaleString()) : '—'}</td></tr>`).join('')
+    : '<tr><td colspan="5" class="stat-note">No usage recorded yet.</td></tr>';
+
+  const maxMachH = Math.max(1, ...(d.byMachine || []).map((mm) => mm.hours));
+  const machRows = (d.byMachine || []).length
+    ? d.byMachine.map((mm) => `<tr><td class="mono">${esc(mm.machine)}</td><td class="stat-note">${esc(mm.template || '—')}</td><td>${hoursBar(mm.hours, maxMachH)}</td><td>${mm.sessions}</td><td>${mm.users}</td><td class="stat-note">${esc(mm.owner || '—')}</td></tr>`).join('')
+    : '<tr><td colspan="6" class="stat-note">No usage recorded yet.</td></tr>';
+
+  let metricsHtml = '';
   if (m.ok) {
     const latest = m.data.latest || {}; const series = m.data.series || [];
     const memPct = latest.memTotal ? Math.round((latest.memUsed / latest.memTotal) * 100) : 0;
     const diskPct = latest.diskTotal ? Math.round((latest.diskUsed / latest.diskTotal) * 100) : 0;
-    const tiles = root.querySelector('#usage-tiles');
-    if (tiles) tiles.innerHTML = [
-      ['Memory', `${memPct}%`, 'of VM'], ['CPU', `${Math.round(latest.cpuPct || 0)}%`, 'across machines'],
-      ['Disk', `${diskPct}%`, 'used'], ['Machines', `${latest.running || 0}`, 'running'],
-    ].map(([l, v, s]) => `<div class="res-tile"><div class="res-tile-label">${l}</div><div class="res-tile-value">${v}</div><div class="res-tile-sub">${s}</div></div>`).join('');
-    const spark = root.querySelector('#usage-spark');
-    if (spark) spark.innerHTML = sparkline(series.map((p) => (p.memTotal ? (p.memUsed / p.memTotal) * 100 : 0)));
+    const rTiles = [['Memory', `${memPct}%`, 'of VM'], ['CPU', `${Math.round(latest.cpuPct || 0)}%`, 'across machines'], ['Disk', `${diskPct}%`, 'used'], ['Running', String(latest.running || 0), 'machines']]
+      .map(([l, v, s]) => `<div class="res-tile"><div class="res-tile-label">${l}</div><div class="res-tile-value">${v}</div><div class="res-tile-sub">${s}</div></div>`).join('');
+    metricsHtml = `${subTitle('Host resources')}<div class="res-tiles">${rTiles}</div>
+      <div class="chart-card"><div class="chart-title">Memory used — recent (per minute)</div><div class="chart-holder">${sparkline(series.map((p) => (p.memTotal ? (p.memUsed / p.memTotal) * 100 : 0)))}</div></div>`;
   }
+
+  holder.innerHTML = `
+    <div class="res-tiles">${tiles}</div>
+    <div class="chart-card"><div class="chart-title">Daily usage (hours)</div><div class="chart-holder">${dailyChart(d.daily || [])}</div></div>
+    ${subTitle('Currently active')}
+    <div class="table-wrap"><table class="table"><thead><tr><th>User</th><th>Machine</th><th>Type</th><th>Elapsed</th></tr></thead><tbody>${activeRows}</tbody></table></div>
+    ${subTitle('By user')}
+    <div class="table-wrap"><table class="table"><thead><tr><th>User</th><th>Time</th><th>Sessions</th><th>Machines</th><th>Last active</th></tr></thead><tbody>${userRows}</tbody></table></div>
+    ${subTitle('By machine')}
+    <div class="table-wrap"><table class="table"><thead><tr><th>Machine</th><th>Type</th><th>Time</th><th>Sessions</th><th>Users</th><th>Owner</th></tr></thead><tbody>${machRows}</tbody></table></div>
+    ${metricsHtml}
+  `;
 }
 function sparkline(vals) {
   if (!vals.length) return '<p class="chart-empty">No history yet — samples once a minute.</p>';

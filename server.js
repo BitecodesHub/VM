@@ -21,6 +21,7 @@ import { ShareStore } from './lib/shares.js';
 import { MachineMetaStore } from './lib/machineMeta.js';
 import { UsageStore } from './lib/usage.js';
 import { UsageSessionStore } from './lib/usage-sessions.js';
+import { summariseSessions } from './lib/analytics.js';
 import { MetricsStore, deriveAlerts } from './lib/metrics.js';
 import { AuditLog } from './lib/audit.js';
 import { sweepStale } from './lib/tmpsweep.js';
@@ -1340,6 +1341,14 @@ const server = http.createServer(async (req, res) => {
     if (rawPath === '/api/usage' && method === 'GET') {
       if (!isAdmin(auth)) return forbidden(res);
       return sendJson(res, 200, { owners: usage.summary() });
+    }
+    // Connected-user session analytics (who used which machine, for how long).
+    if (rawPath === '/api/analytics' && method === 'GET') {
+      if (!isAdmin(auth)) return forbidden(res);
+      const days = Math.min(365, Math.max(1, parseInt(new URL(req.url, `http://${LOOPBACK}`).searchParams.get('days') || '30', 10) || 30));
+      const now = Date.now();
+      const closed = usageSessions.closedList({ sinceMs: now - days * 86_400_000 });
+      return sendJson(res, 200, summariseSessions(closed, usageSessions.liveList(), { now, days }));
     }
     if (rawPath === '/api/metrics' && method === 'GET') {
       if (!isAdmin(auth)) return forbidden(res);
