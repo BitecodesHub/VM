@@ -97,7 +97,9 @@ test('ext: SSO mint → redeem sets an embed cookie once, then blocks replay', a
     // Redeem on the MACHINE origin → 302 with an embed Set-Cookie into the screen.
     const redeem = await panel.req('GET', mint.json.path, { machine: true });
     assert.equal(redeem.status, 302);
-    assert.match(redeem.headers.get('location') || '', /^\/m\/shared-desk\/$/);
+    // Redirects into the machine's viewer URL (autoconnect + websockify path),
+    // not the bare /m/<name>/ landing that shows a manual Connect button.
+    assert.match(redeem.headers.get('location') || '', /^\/m\/shared-desk\//);
     assert.match(redeem.setCookie || '', /SameSite=None/i);
     assert.match(redeem.setCookie || '', /Partitioned/i);
 

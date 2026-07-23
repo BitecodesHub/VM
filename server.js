@@ -1599,8 +1599,26 @@ async function handleSsoRedeem(req, res, setUser) {
   const { setCookie } = await sessions.create(payload.username, { ip: clientIp(req), userAgent: req.headers['user-agent'], embed: true });
   setUser?.(payload.username);
   recordAudit(req, payload.username, 'sso.login', payload.machine || null, { via: 'prism-embed' });
-  // Machine → same-origin screen; no machine → the panel SPA on its own origin.
-  const dest = payload.machine ? `/m/${encodeURIComponent(payload.machine)}/` : `${panelOriginFor(req)}/`;
+  // Redirect into the machine's REAL viewer URL (card.uiUrl = autoconnect +
+  // resize + the websockify `path=` + any password), never the bare /m/<name>/
+  // landing — that shows a manual "Connect" button and cannot find the socket
+  // ("Failed to connect to server"). For browser nodes, kick off the WebDriver
+  // session so the node opens straight into Chrome/Firefox, mirroring the
+  // panel's own open flow. No machine → the panel SPA on its own origin.
+  let dest = `${panelOriginFor(req)}/`;
+  if (payload.machine) {
+    let card = null;
+    try { card = await resolveMachineCached(payload.machine); } catch { /* ignore */ }
+    if (card && isPanelMachine(card) && card.uiUrl) {
+      const t = TEMPLATES[card.template];
+      if (card.webdriver && t?.wdBrowserName && card.state === 'running') {
+        openBrowserSession({ username: payload.username, role: user.role }, payload.machine).catch(() => {});
+      }
+      dest = card.uiUrl;
+    } else {
+      dest = `/m/${encodeURIComponent(payload.machine)}/`;
+    }
+  }
   // No X-Frame-Options here: this 302 travels inside the PRISM iframe. The final
   // screen document's framing is governed by its CSP frame-ancestors allow-list.
   res.writeHead(302, { Location: dest, 'Set-Cookie': setCookie, 'Cache-Control': 'no-store' });
