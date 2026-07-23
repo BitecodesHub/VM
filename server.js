@@ -4,6 +4,7 @@ import net from 'node:net';
 import os from 'node:os';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import {
@@ -22,6 +23,7 @@ import { MachineMetaStore } from './lib/machineMeta.js';
 import { UsageStore } from './lib/usage.js';
 import { UsageSessionStore } from './lib/usage-sessions.js';
 import { summariseSessions } from './lib/analytics.js';
+import { mintSsoToken, verifySsoToken, OneTimeGuard } from './lib/sso.js';
 import { MetricsStore, deriveAlerts } from './lib/metrics.js';
 import { AuditLog } from './lib/audit.js';
 import { sweepStale } from './lib/tmpsweep.js';
@@ -107,6 +109,8 @@ try { usageSessions.load(); } catch (e) { console.error(`[VMP_USAGE] ignoring co
   const orphaned = usageSessions.reconcile('panel_restart');
   if (orphaned) console.error(`[VMP_USAGE] closed ${orphaned} orphaned session(s) left open by the previous process`);
 }
+// Single-use tracker for SSO login tokens (replay protection within their TTL).
+const ssoGuard = new OneTimeGuard();
 // Real client IP behind the Caddy loopback front. Caddy appends the true client
 // IP to X-Forwarded-For; trust it ONLY when the immediate peer is loopback (the
 // reverse proxy), and take the RIGHTMOST hop (the one Caddy appended — a client
@@ -1217,6 +1221,10 @@ const server = http.createServer(async (req, res) => {
       return res.end(metrics.prometheus());
     }
 
+    // External API for PRISM — bearer-token, server-to-server. Handled before the
+    // session gate (PRISM has no cookie). OFF unless config.panelApiToken is set.
+    if (rawPath.startsWith('/api/ext/')) return handleExtApi(req, res, rawPath, method);
+
     // P0-2: machine screens live on the SECOND origin (MACHINE_PORT), never the
     // panel API origin. A stray /m/ hit here means an old link — point it there.
     if (rawPath.startsWith('/m/')) {
@@ -1427,6 +1435,172 @@ const server = http.createServer(async (req, res) => {
 function isAdmin(auth) { return auth.user.role === 'admin'; }
 function forbidden(res) { return sendJson(res, 403, { error: { code: 'FORBIDDEN', message: 'You do not have permission to do that.' } }); }
 
+// ---- External API for PRISM (bearer-token, server-to-server) ---------------
+// Lets PRISM manage assignments, provision machines, read analytics, and mint
+// SSO links — all without a browser session. OFF unless config.panelApiToken is
+// set. This is the ONLY surface another app can call; it never exposes secrets.
+const EXT_BAD_JSON = { error: { code: 'VALIDATION', message: 'invalid JSON body' } };
+
+// Hostname (no port), IPv6-literal-safe — mirrors panelFrameAncestors parsing.
+function hostOnly(hostHeader) {
+  const h = String(hostHeader || '');
+  if (h.startsWith('[')) return h.slice(0, h.indexOf(']') + 1) || 'localhost';
+  const i = h.indexOf(':');
+  return (i === -1 ? h : h.slice(0, i)) || 'localhost';
+}
+function originFor(req, tlsPort, plainPort) {
+  const host = hostOnly(req.headers.host);
+  if (config.publicTls) return `https://${host}${tlsPort === 443 ? '' : ':' + tlsPort}`;
+  return `http://${host}:${plainPort}`;
+}
+const machineOriginFor = (req) => originFor(req, config.machineHttpsPort, machinePort);
+const panelOriginFor = (req) => originFor(req, config.panelHttpsPort, config.port);
+
+// A strong random password for ext-provisioned users. They never type it — they
+// only ever arrive via SSO — but users.create requires one (>=10 chars).
+function generatePassword(len = 24) {
+  const chars = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const bytes = crypto.randomBytes(len);
+  let out = '';
+  for (let i = 0; i < len; i++) out += chars[bytes[i] % chars.length];
+  return out;
+}
+
+function extAuthOk(req) {
+  if (!config.panelApiToken) return false;
+  const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (!token) return false;
+  const a = Buffer.from(token), b = Buffer.from(config.panelApiToken);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+async function handleExtApi(req, res, rawPath, method) {
+  // Feature-off looks like a non-existent endpoint (leaks nothing about config).
+  if (!config.panelApiToken) return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such endpoint' } });
+  if (!extAuthOk(req)) { res.setHeader('WWW-Authenticate', 'Bearer'); return sendJson(res, 401, { error: { code: 'UNAUTHENTICATED', message: 'bearer token required' } }); }
+  const sub = rawPath.slice('/api/ext'.length);
+  let m;
+
+  // List all panel machines with their sharing ACL + screen path.
+  if (sub === '/machines' && method === 'GET') {
+    let cards = [];
+    try { cards = await inspectCards(); } catch { /* docker down → empty */ }
+    const machines = cards.filter(isPanelMachine).map((c) => ({
+      name: c.name,
+      displayName: machineMeta.displayName(c.name) || null,
+      template: c.template,
+      owner: c.owner,
+      state: c.state,
+      sharedWith: shares.listFor(c.name),
+      createdAt: c.createdAt || null,
+      screenPath: `/m/${c.name}/`,
+    }));
+    return sendJson(res, 200, { machines, machineOrigin: machineOriginFor(req) });
+  }
+
+  // List VM users (no secrets).
+  if (sub === '/users' && method === 'GET') {
+    return sendJson(res, 200, { users: users.list().map((u) => UserStore.publicUser(u)) });
+  }
+
+  // Ensure a VM user exists (idempotent). Body: { username, role? }.
+  if (sub === '/users' && method === 'POST') {
+    const body = await readJson(req);
+    if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+    const username = String(body.username || '').toLowerCase();
+    if (!validateUsername(username)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid username (3–32 lowercase letters/digits/_/-, starts with a letter)' } });
+    const role = body.role === 'admin' ? 'admin' : 'user';
+    const existing = users.get(username);
+    if (existing) return sendJson(res, 200, { ok: true, created: false, user: UserStore.publicUser(existing) });
+    try {
+      const user = await users.create({ username, password: generatePassword(), role, mustChangePassword: false });
+      recordAudit(req, 'prism', 'user.create', username, { role, via: 'ext' });
+      return sendJson(res, 201, { ok: true, created: true, user: UserStore.publicUser(user) });
+    } catch (e) {
+      if (e.code === 'USER_EXISTS') { const u = users.get(username); return sendJson(res, 200, { ok: true, created: false, user: u ? UserStore.publicUser(u) : null }); }
+      throw e;
+    }
+  }
+
+  // Get / set a machine's share ACL (assign & unassign). PUT body: { sharedWith: [] }.
+  if ((m = sub.match(/^\/machines\/([^/]+)\/access$/))) {
+    const name = decodeURIComponent(m[1]);
+    if (method === 'GET') { const out = await getAccess(name); return sendJson(res, out.status, out.body); }
+    if (method === 'PUT') {
+      const body = await readJson(req);
+      if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+      const out = await putAccess(name, body.sharedWith);
+      if (out.status === 200) { invalidateMachineCache(); recordAudit(req, 'prism', 'machine.access', name, { sharedWith: body.sharedWith }); }
+      return sendJson(res, out.status, out.body);
+    }
+  }
+
+  // Provision a machine owned by a target user. Body: { owner, template, name?, viewers?, cap? }.
+  if (sub === '/machines' && method === 'POST') {
+    const body = await readJson(req);
+    if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+    const owner = String(body.owner || body.username || '').toLowerCase();
+    if (!validateUsername(owner) || !users.get(owner)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'unknown owner user' } });
+    // Act as an admin-capable actor OWNED by the target (custom name/viewers OK,
+    // no per-user quota) — provisioning is an administrative operation.
+    const out = await createMachine({ username: owner, role: 'admin' }, body.template, { name: body.name, viewers: body.viewers, cap: body.cap });
+    if (out.status < 300) { invalidateMachineCache(); recordAudit(req, 'prism', 'machine.create', out.body?.name || body.name || null, { template: body.template, owner, via: 'ext' }); }
+    return sendJson(res, out.status, out.body);
+  }
+
+  // Usage analytics feed (same shape as GET /api/analytics).
+  if (sub === '/analytics' && method === 'GET') {
+    const days = Math.min(365, Math.max(1, parseInt(new URL(req.url, `http://${LOOPBACK}`).searchParams.get('days') || '30', 10) || 30));
+    const now = Date.now();
+    const closed = usageSessions.closedList({ sinceMs: now - days * 86_400_000 });
+    return sendJson(res, 200, summariseSessions(closed, usageSessions.liveList(), { now, days }));
+  }
+
+  // Mint a one-time SSO link for a user (+ optional machine) to embed in PRISM.
+  if (sub === '/sso/mint' && method === 'POST') {
+    const body = await readJson(req);
+    if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+    const username = String(body.username || '').toLowerCase();
+    if (!validateUsername(username)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid username' } });
+    const user = users.get(username);
+    if (!user) return sendJson(res, 404, { error: { code: 'USER_NOT_FOUND', message: 'no such user' } });
+    if (user.disabled) return sendJson(res, 403, { error: { code: 'USER_DISABLED', message: 'user is disabled' } });
+    const machine = body.machine ? String(body.machine) : null;
+    if (machine && !validateName(machine)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid machine name' } });
+    const ttlSec = Math.min(300, Math.max(15, parseInt(body.ttlSec, 10) || 60));
+    const now = Date.now();
+    const token = mintSsoToken(SECRET, { username, machine, ttlSec, now });
+    const link = `/sso?t=${encodeURIComponent(token)}`;
+    recordAudit(req, 'prism', 'sso.mint', username, { machine, via: 'ext' });
+    return sendJson(res, 200, { ok: true, token, path: link, url: machineOriginFor(req) + link, expiresAt: new Date(now + ttlSec * 1000).toISOString() });
+  }
+
+  return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such endpoint' } });
+}
+
+// Redeem a one-time SSO token (browser GET on the machine origin): set an embed
+// session cookie, then redirect into the machine screen. Enables the fully
+// embedded desktop inside PRISM without the user logging into the panel.
+async function handleSsoRedeem(req, res, setUser) {
+  if (!config.panelApiToken) return sendHtml(res, 404, errorPage(404, 'Not found', 'Single sign-on is not enabled on this panel.'));
+  const url = new URL(req.url, `http://${req.headers.host || LOOPBACK}`);
+  const now = Date.now();
+  const payload = verifySsoToken(SECRET, url.searchParams.get('t') || '', { now });
+  if (!payload) return sendHtml(res, 401, errorPage(401, 'Sign-in link expired', 'This link is invalid or has expired. Return to PRISM and open the desktop again.'));
+  if (!ssoGuard.claim(payload.jti, payload.exp)) return sendHtml(res, 401, errorPage(401, 'Link already used', 'This sign-in link was already used. Return to PRISM and open the desktop again.'));
+  const user = users.get(payload.username);
+  if (!user || user.disabled) return sendHtml(res, 403, errorPage(403, 'No access', 'This account cannot sign in.'));
+  const { setCookie } = await sessions.create(payload.username, { ip: clientIp(req), userAgent: req.headers['user-agent'], embed: true });
+  setUser?.(payload.username);
+  recordAudit(req, payload.username, 'sso.login', payload.machine || null, { via: 'prism-embed' });
+  // Machine → same-origin screen; no machine → the panel SPA on its own origin.
+  const dest = payload.machine ? `/m/${encodeURIComponent(payload.machine)}/` : `${panelOriginFor(req)}/`;
+  // No X-Frame-Options here: this 302 travels inside the PRISM iframe. The final
+  // screen document's framing is governed by its CSP frame-ancestors allow-list.
+  res.writeHead(302, { Location: dest, 'Set-Cookie': setCookie, 'Cache-Control': 'no-store' });
+  return res.end();
+}
+
 // ---- Route handlers --------------------------------------------------------
 async function handleSetup(req, res, setUser) {
   if (!users.isEmpty()) return sendJson(res, 409, { error: { code: 'SETUP_ALREADY_DONE', message: 'setup already completed' } });
@@ -1593,6 +1767,8 @@ function panelFrameAncestors(req) {
   // allow it to frame the screens. Include the port-less :443 form (browsers omit
   // the default port) so framing is not blocked on a :443 deployment.
   for (const o of publicOrigins(config.panelHttpsPort)) parts.push(o);
+  // External apps explicitly allowed to embed the screens (e.g. the PRISM app).
+  for (const o of config.embedOrigins || []) parts.push(o);
   return parts.join(' ');
 }
 
@@ -1702,6 +1878,8 @@ const machineServer = http.createServer(async (req, res) => {
     const rawPath = req.url.split('?')[0];
     if (req.method === 'GET' && rawPath === '/healthz') return sendJson(res, 200, { ok: true });
     if (!isAllowedHost(req.headers.host, machinePort, EXTRA_HOSTS)) return sendText(res, 400, 'Bad host');
+    // One-time SSO redeem → sets an embed cookie and redirects into the screen.
+    if (req.method === 'GET' && rawPath === '/sso') return handleSsoRedeem(req, res, (u) => { logUser = u; });
     if (rawPath.startsWith('/m/')) return handleProxy(req, res, (u) => { logUser = u; });
     return sendHtml(res, 404, errorPage(404, 'Not found', 'Machine screens are served here; open the panel to pick one.'));
   } catch (e) {
