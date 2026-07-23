@@ -71,6 +71,20 @@ test('ext: set a machine access ACL (assign), validated against real users', asy
   });
 });
 
+test('ext: behind TLS, machineOrigin + SSO url use the public host, not the request Host', async () => {
+  const panel = await spawnPanel({
+    env: { VMP_PANEL_API_TOKEN: TOKEN },
+    config: { publicTls: true, publicHost: 'vm.example.test', machineHttpsPort: 5443, panelHttpsPort: 8443 },
+  })
+  try {
+    await setupAdmin(panel)
+    const list = await panel.req('GET', '/api/ext/machines', { headers: AUTH })
+    assert.equal(list.json.machineOrigin, 'https://vm.example.test:5443', 'public host, not 127.0.0.1')
+    const mint = await panel.req('POST', '/api/ext/sso/mint', { headers: AUTH, body: { username: 'admin' } })
+    assert.match(mint.json.url, /^https:\/\/vm\.example\.test:5443\/sso\?t=/)
+  } finally { panel.kill() }
+})
+
 test('ext: SSO mint → redeem sets an embed cookie once, then blocks replay', async () => {
   await withExtPanel(async (panel) => {
     await setupAdmin(panel);

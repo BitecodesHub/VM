@@ -1449,9 +1449,15 @@ function hostOnly(hostHeader) {
   return (i === -1 ? h : h.slice(0, i)) || 'localhost';
 }
 function originFor(req, tlsPort, plainPort) {
-  const host = hostOnly(req.headers.host);
-  if (config.publicTls) return `https://${host}${tlsPort === 443 ? '' : ':' + tlsPort}`;
-  return `http://${host}:${plainPort}`;
+  // Behind the Caddy TLS front the panel sees an internal loopback Host header,
+  // so the public origin MUST come from the configured publicHost (the cert
+  // name), not from req.headers.host. Fall back to the request host only for the
+  // plaintext LAN/localhost deployment where there is no publicHost.
+  if (config.publicTls) {
+    const host = config.publicHost || hostOnly(req.headers.host);
+    return `https://${host}${tlsPort === 443 ? '' : ':' + tlsPort}`;
+  }
+  return `http://${hostOnly(req.headers.host)}:${plainPort}`;
 }
 const machineOriginFor = (req) => originFor(req, config.machineHttpsPort, machinePort);
 const panelOriginFor = (req) => originFor(req, config.panelHttpsPort, config.port);
