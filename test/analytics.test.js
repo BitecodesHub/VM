@@ -65,6 +65,20 @@ test('peak concurrency counts overlapping intervals, not clean handoffs', () => 
   assert.equal(summariseSessions(handoff, [], { now: NOW, days: 1 }).totals.peakConcurrency, 1);
 });
 
+test('peak concurrency includes live sessions overlapping closed ones', () => {
+  const closed = [row('a', 'm1', '2026-07-23T11:00:00Z', '2026-07-23T11:59:00Z')]
+  const live = [{ user: 'b', machine: 'm2', startedAt: '2026-07-23T11:30:00Z', durationSec: 1800 }]
+  // closed(a) 11:00–11:59 overlaps live(b) 11:30→now → 2 concurrent, even though live.length is 1.
+  assert.equal(summariseSessions(closed, live, { now: NOW, days: 1 }).totals.peakConcurrency, 2)
+})
+
+test('active list never leaks client IP', () => {
+  const live = [{ user: 'a', machine: 'm1', template: 't', startedAt: '2026-07-23T11:59:00Z', durationSec: 60, ip: '203.0.113.9' }]
+  const d = summariseSessions([], live, { now: NOW, days: 1 })
+  assert.equal(d.active.length, 1)
+  assert.ok(!('ip' in d.active[0]), 'ip must be stripped from the analytics DTO')
+})
+
 test('live sessions drive active-now and floor peak concurrency', () => {
   const live = [
     { user: 'alice', machine: 'm1', durationSec: 120 },

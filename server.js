@@ -1215,7 +1215,7 @@ const server = http.createServer(async (req, res) => {
     if (method === 'GET' && rawPath === '/metrics') {
       const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
       const a = authenticateRequest(req);
-      const ok = (a && a.user.role === 'admin') || (config.metricsToken && bearer === config.metricsToken);
+      const ok = (a && a.user.role === 'admin') || (!!config.metricsToken && constantTimeEq(bearer, config.metricsToken));
       if (!ok) { res.writeHead(401, { 'Content-Type': 'text/plain', 'WWW-Authenticate': 'Bearer' }); return res.end('unauthorized'); }
       res.writeHead(200, { 'Content-Type': 'text/plain; version=0.0.4; charset=utf-8', 'Cache-Control': 'no-store' });
       return res.end(metrics.prometheus());
@@ -1223,7 +1223,7 @@ const server = http.createServer(async (req, res) => {
 
     // External API for PRISM — bearer-token, server-to-server. Handled before the
     // session gate (PRISM has no cookie). OFF unless config.panelApiToken is set.
-    if (rawPath.startsWith('/api/ext/')) return handleExtApi(req, res, rawPath, method);
+    if (rawPath.startsWith('/api/ext/')) return await handleExtApi(req, res, rawPath, method);
 
     // P0-2: machine screens live on the SECOND origin (MACHINE_PORT), never the
     // panel API origin. A stray /m/ hit here means an old link — point it there.
@@ -1243,13 +1243,13 @@ const server = http.createServer(async (req, res) => {
     // ---- Setup gate ------------------------------------------------------
     if (rawPath === '/api/setup') {
       if (method === 'GET') return sendJson(res, 200, { needed: users.isEmpty() });
-      if (method === 'POST') return handleSetup(req, res, (u) => { logUser = u; });
+      if (method === 'POST') return await handleSetup(req, res, (u) => { logUser = u; });
       return sendJson(res, 405, { error: { code: 'VALIDATION', message: 'method not allowed' } });
     }
     if (users.isEmpty()) return sendJson(res, 409, { error: { code: 'SETUP_REQUIRED', message: 'no users yet' } });
 
     // ---- Login (unauthenticated) -----------------------------------------
-    if (rawPath === '/api/login' && method === 'POST') return handleLogin(req, res, (u) => { logUser = u; });
+    if (rawPath === '/api/login' && method === 'POST') return await handleLogin(req, res, (u) => { logUser = u; });
 
     // ---- Authenticate ----------------------------------------------------
     const hadCookie = !!req.headers.cookie && req.headers.cookie.includes('vmp_session=');
@@ -1287,7 +1287,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true }, { 'Set-Cookie': sessions.clearCookie() });
     }
     if (rawPath === '/api/me' && method === 'GET') return sendJson(res, 200, meBody(auth.fullUser));
-    if (rawPath === '/api/me/password' && method === 'PATCH') return handleChangePassword(req, res, auth);
+    if (rawPath === '/api/me/password' && method === 'PATCH') return await handleChangePassword(req, res, auth);
 
     // mustChangePassword gate — everything else blocked until changed.
     if (auth.fullUser.mustChangePassword) {
@@ -1297,15 +1297,15 @@ const server = http.createServer(async (req, res) => {
     // ---- Admin user management -------------------------------------------
     if (rawPath === '/api/users') {
       if (!isAdmin(auth)) return forbidden(res);
-      if (method === 'GET') return handleListUsers(res);
-      if (method === 'POST') return handleCreateUser(req, res, auth);
+      if (method === 'GET') return await handleListUsers(res);
+      if (method === 'POST') return await handleCreateUser(req, res, auth);
     }
     let m;
     if ((m = rawPath.match(/^\/api\/users\/([^/]+)$/))) {
       if (!isAdmin(auth)) return forbidden(res);
       const target = decodeURIComponent(m[1]);
-      if (method === 'PATCH') return handlePatchUser(req, res, auth, target);
-      if (method === 'DELETE') return handleDeleteUser(req, res, auth, target);
+      if (method === 'PATCH') return await handlePatchUser(req, res, auth, target);
+      if (method === 'DELETE') return await handleDeleteUser(req, res, auth, target);
     }
 
     // ---- Machines --------------------------------------------------------
@@ -1376,8 +1376,8 @@ const server = http.createServer(async (req, res) => {
     }
     if ((m = rawPath.match(/^\/api\/machines\/([^/]+)\/files\/(.+)$/))) {
       const name = decodeURIComponent(m[1]); const fn = decodeURIComponent(m[2]);
-      if (method === 'GET') return downloadMachineFile(auth.user, name, fn, res);
-      if (method === 'POST') return uploadMachineFile(auth.user, name, fn, req, res);
+      if (method === 'GET') return await downloadMachineFile(auth.user, name, fn, res);
+      if (method === 'POST') return await uploadMachineFile(auth.user, name, fn, req, res);
       if (method === 'DELETE') { const out = await deleteMachineFile(auth.user, name, fn); return sendJson(res, out.status, out.body); }
     }
 
@@ -1472,12 +1472,17 @@ function generatePassword(len = 24) {
   return out;
 }
 
+// Length-checked constant-time string compare (avoids leaking token length or
+// prefix via early-exit timing). Empty inputs never match.
+function constantTimeEq(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string' || a.length !== b.length || a.length === 0) return false;
+  return crypto.timingSafeEqual(Buffer.from(a), Buffer.from(b));
+}
+
 function extAuthOk(req) {
   if (!config.panelApiToken) return false;
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-  if (!token) return false;
-  const a = Buffer.from(token), b = Buffer.from(config.panelApiToken);
-  return a.length === b.length && crypto.timingSafeEqual(a, b);
+  return constantTimeEq(token, config.panelApiToken);
 }
 
 async function handleExtApi(req, res, rawPath, method) {
@@ -1878,6 +1883,11 @@ async function handleUpgrade(req, socket, head) {
     if (!card || !isPanelMachine(card) || !canUse(accessFor(auth.user, card)) || card.localOnly || !card.uiPort || card.state !== 'running') {
       socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
     }
+    // The client can disconnect DURING the async docker lookup above. If so,
+    // bail before incrementing ref-counts — the 'close' listener below is
+    // registered too late to fire for an already-closed socket, which would
+    // otherwise leak the machine open-count and the usage session forever.
+    if (socket.destroyed) return;
     socket._vmpUser = auth.user.username; // tag for revocation
     // Track an open screen connection so the idle reaper never stops a machine
     // someone is actively viewing, AND attribute usage to the CONNECTED user
@@ -1903,8 +1913,8 @@ const machineServer = http.createServer(async (req, res) => {
     if (req.method === 'GET' && rawPath === '/healthz') return sendJson(res, 200, { ok: true });
     if (!isAllowedHost(req.headers.host, machinePort, EXTRA_HOSTS)) return sendText(res, 400, 'Bad host');
     // One-time SSO redeem → sets an embed cookie and redirects into the screen.
-    if (req.method === 'GET' && rawPath === '/sso') return handleSsoRedeem(req, res, (u) => { logUser = u; });
-    if (rawPath.startsWith('/m/')) return handleProxy(req, res, (u) => { logUser = u; });
+    if (req.method === 'GET' && rawPath === '/sso') return await handleSsoRedeem(req, res, (u) => { logUser = u; });
+    if (rawPath.startsWith('/m/')) return await handleProxy(req, res, (u) => { logUser = u; });
     return sendHtml(res, 404, errorPage(404, 'Not found', 'Machine screens are served here; open the panel to pick one.'));
   } catch (e) {
     if (!res.headersSent) sendText(res, 500, 'error');
