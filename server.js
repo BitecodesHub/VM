@@ -1533,6 +1533,59 @@ async function handleExtApi(req, res, rawPath, method) {
     }
   }
 
+  // Enable / disable a VM user. Disabling immediately destroys their sessions +
+  // live tunnels and blocks reconnect — PRISM calls this on offboarding.
+  if ((m = sub.match(/^\/users\/([^/]+)\/disabled$/)) && method === 'PUT') {
+    const name = String(decodeURIComponent(m[1])).toLowerCase();
+    const body = await readJson(req);
+    if (!body || typeof body.disabled !== 'boolean') return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'disabled must be a boolean' } });
+    const u = users.get(name);
+    if (!u) return sendJson(res, 404, { error: { code: 'USER_NOT_FOUND', message: 'no such user' } });
+    if (body.disabled && users.isLastActiveAdmin(name)) return sendJson(res, 409, { error: { code: 'LAST_ADMIN', message: 'cannot disable the last administrator' } });
+    await users.setDisabled(name, body.disabled);
+    if (body.disabled) { await sessions.destroyForUser(name); killTunnelsForUser(name); }
+    recordAudit(req, 'prism', 'user.update', name, { disabled: body.disabled, via: 'ext' });
+    return sendJson(res, 200, { ok: true, user: UserStore.publicUser(users.get(name)) });
+  }
+
+  // Delete a VM user: revoke sessions + tunnels, scrub them from every machine
+  // ACL, and optionally delete the machines they own. Idempotent.
+  if ((m = sub.match(/^\/users\/([^/]+)$/)) && method === 'DELETE') {
+    const name = String(decodeURIComponent(m[1])).toLowerCase();
+    if (!users.get(name)) return sendJson(res, 200, { ok: true, deleted: false });
+    if (users.isLastActiveAdmin(name)) return sendJson(res, 409, { error: { code: 'LAST_ADMIN', message: 'cannot delete the last administrator' } });
+    const body = (await readJson(req)) || {};
+    const deleted = [];
+    if (body.deleteMachines) {
+      let cards = [];
+      try { cards = await inspectCards(); } catch { /* VM down */ }
+      for (const c of cards.filter((c) => c.owner === name && !PROTECTED_NAMES.has(c.name))) {
+        inFlight.add(c.name);
+        try { if (await rmContainer(c.name)) { deleted.push(c.name); await shares.removeMachine(c.name); await machineMeta.removeMachine(c.name); } }
+        finally { inFlight.delete(c.name); }
+      }
+      invalidateMachineCache();
+    }
+    await sessions.destroyForUser(name);
+    killTunnelsForUser(name);
+    await shares.removeUser(name);
+    await users.remove(name);
+    recordAudit(req, 'prism', 'user.delete', name, { deletedMachines: deleted.length, via: 'ext' });
+    return sendJson(res, 200, { ok: true, deleted: true, deletedMachines: deleted });
+  }
+
+  // Machine lifecycle (admin-driven from PRISM): start | stop | restart.
+  if ((m = sub.match(/^\/machines\/([^/]+)\/action$/)) && method === 'POST') {
+    const name = decodeURIComponent(m[1]);
+    const body = await readJson(req);
+    if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+    const action = String(body.action || '');
+    if (!['start', 'stop', 'restart'].includes(action)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'action must be start, stop or restart' } });
+    const out = await lifecycle({ username: 'prism', role: 'admin' }, name, action);
+    if (out.status < 300) { invalidateMachineCache(); recordAudit(req, 'prism', `machine.${action}`, name, { via: 'ext' }); }
+    return sendJson(res, out.status, out.body);
+  }
+
   // Get / set a machine's share ACL (assign & unassign). PUT body: { sharedWith: [] }.
   if ((m = sub.match(/^\/machines\/([^/]+)\/access$/))) {
     const name = decodeURIComponent(m[1]);

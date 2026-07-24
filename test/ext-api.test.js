@@ -71,6 +71,32 @@ test('ext: set a machine access ACL (assign), validated against real users', asy
   });
 });
 
+test('ext: user disable/enable + delete revoke access; machine lifecycle action', async () => {
+  await withExtPanel(async (panel) => {
+    const admin = await setupAdmin(panel)
+    await panel.req('POST', '/api/ext/users', { headers: AUTH, body: { username: 'temp-user' } })
+
+    let r = await panel.req('PUT', '/api/ext/users/temp-user/disabled', { headers: AUTH, body: { disabled: true } })
+    assert.equal(r.status, 200)
+    assert.equal(r.json.user.disabled, true)
+    r = await panel.req('PUT', '/api/ext/users/temp-user/disabled', { headers: AUTH, body: { disabled: false } })
+    assert.equal(r.json.user.disabled, false)
+    assert.equal((await panel.req('PUT', '/api/ext/users/temp-user/disabled', { headers: AUTH, body: {} })).status, 400, 'bad body rejected')
+
+    r = await panel.req('DELETE', '/api/ext/users/temp-user', { headers: AUTH })
+    assert.equal(r.status, 200)
+    assert.equal(r.json.deleted, true)
+    assert.ok(!(await panel.req('GET', '/api/ext/users', { headers: AUTH })).json.users.some((u) => u.username === 'temp-user'))
+    assert.equal((await panel.req('DELETE', '/api/ext/users/temp-user', { headers: AUTH })).json.deleted, false, 'delete is idempotent')
+
+    const made = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop', name: 'life-desk' } })
+    assert.equal(made.status, 202)
+    assert.equal((await panel.req('POST', '/api/ext/machines/life-desk/action', { headers: AUTH, body: { action: 'nope' } })).status, 400, 'bad action rejected')
+    const stop = await panel.req('POST', '/api/ext/machines/life-desk/action', { headers: AUTH, body: { action: 'stop' } })
+    assert.ok(stop.status < 300, `stop ok (got ${stop.status} ${JSON.stringify(stop.json)})`)
+  })
+})
+
 test('ext: behind TLS, machineOrigin + SSO url use the public host, not the request Host', async () => {
   const panel = await spawnPanel({
     env: { VMP_PANEL_API_TOKEN: TOKEN },
