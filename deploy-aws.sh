@@ -44,8 +44,18 @@ apt-get install -y "linux-headers-$(uname -r)" v4l2loopback-dkms v4l2loopback-ut
 
 echo "[4/7] Building/provisioning ALL template images (the slow part)…"
 # Both desktops are KasmVNC-based (audio/mic/camera by default).
-docker build -t minimal-linux-desktop:xfce   "$APP_DIR/images/linux-desktop"  || echo "  WARN: xfce desktop build failed"
-docker build -t minimal-linux-desktop:icewm  "$APP_DIR/images/icewm-desktop"  || echo "  WARN: icewm desktop build failed"
+#
+# These builds are FATAL on failure, deliberately. They used to be `|| echo WARN`,
+# which let a host finish deploying "successfully" while a template's image was
+# missing or stale — and that is exactly how this product broke in practice: the
+# Dockerfiles moved from noVNC to KasmVNC, the images were never rebuilt, and every
+# desktop silently became unopenable. A deploy that cannot build the images it
+# promises must stop here, while the operator is still watching, not hand over a
+# host that 500s at first use.
+docker build -t minimal-linux-desktop:xfce   "$APP_DIR/images/linux-desktop" \
+  || { echo "FATAL: xfce desktop image build failed — aborting deploy (desktops would be unopenable)." >&2; exit 1; }
+docker build -t minimal-linux-desktop:icewm  "$APP_DIR/images/icewm-desktop" \
+  || { echo "FATAL: icewm desktop image build failed — aborting deploy (desktops would be unopenable)." >&2; exit 1; }
 # Selenium node images: pull the public multi-arch seleniarm images, then build
 # the kiosk overlay (undecorated, unminimizable, maximized browser windows) and
 # tag it to the local names the templates reference, so Chrome/Firefox nodes
@@ -159,12 +169,64 @@ ${PUBLIC_HOST}:5443 {
 CADDY
 fi
 
-echo "[7/7] Starting services…"
+echo "[7/8] Starting services…"
 systemctl daemon-reload
 systemctl enable --now vm-panel.service
 systemctl enable --now vm-panel-backup.timer
 systemctl start vm-panel-backup.service || true   # take an initial backup now
 systemctl restart caddy
 
+# ── Post-deploy verification ────────────────────────────────────────────────────
+# A deploy is not finished because systemd returned 0. Prove the thing actually
+# serves before telling the operator it is ready: the previous script printed
+# DEPLOY_OK unconditionally, so a host with drifted images and a panel that never
+# came up still reported success.
+echo "[8/8] Verifying the deploy…"
+verify_fail=0
+
+# 1. Template images must match what the code proxies to.
+if [ -x "$APP_DIR/launchers/verify-images.sh" ] || [ -f "$APP_DIR/launchers/verify-images.sh" ]; then
+  if VMP_DOCKER=/usr/bin/docker bash "$APP_DIR/launchers/verify-images.sh"; then
+    echo "  images: OK"
+  else
+    echo "  images: DRIFT — desktops using the drifted template cannot be proxied." >&2
+    verify_fail=1
+  fi
+else
+  echo "  images: verify-images.sh not present in this build — skipping (upgrade the release)." >&2
+fi
+
+# 2. The panel must answer its own readiness probe (checks docker reachability too).
+ready=""
+for _ in $(seq 1 30); do
+  ready="$(curl -fsS --max-time 3 http://127.0.0.1:5050/readyz 2>/dev/null || true)"
+  case "$ready" in *'"ok":true'*) break ;; esac
+  sleep 2
+done
+case "$ready" in
+  *'"ok":true'*) echo "  panel: ready ($(echo "$ready" | head -c 120))" ;;
+  *)
+    echo "  panel: NOT READY after 60s — last response: ${ready:-<none>}" >&2
+    echo "         journalctl -u vm-panel -n 50 --no-pager" >&2
+    systemctl is-active --quiet vm-panel.service || echo "         vm-panel.service is not active" >&2
+    verify_fail=1 ;;
+esac
+
+# 3. The public TLS front must terminate and reach the panel.
+code="$(curl -fsS -o /dev/null -w '%{http_code}' -k --max-time 8 "https://127.0.0.1:443/healthz" 2>/dev/null || echo 000)"
+case "$code" in
+  200) echo "  TLS front: OK (https → panel /healthz 200)" ;;
+  *)   echo "  TLS front: /healthz via https returned $code — check 'systemctl status caddy'." >&2; verify_fail=1 ;;
+esac
+
+echo
+if [ "$verify_fail" -ne 0 ]; then
+  echo "DEPLOY_FAILED_VERIFICATION — the services are installed but the deploy did NOT pass its checks above." >&2
+  echo "Fix the reported problem and re-run; do not hand this host to users yet." >&2
+  exit 1
+fi
+
 echo "DEPLOY_OK — open https://${PUBLIC_HOST}/ to create the admin account."
 echo "TLS cert (self-signed; trust on clients or accept the warning for mic/camera): /etc/caddy/vmpanel.crt"
+echo "Acceptance test (optional, creates and destroys one desktop):"
+echo "  sudo -u $RUN_USER node $APP_DIR/launchers/e2e-real.mjs"
