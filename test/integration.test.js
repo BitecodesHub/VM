@@ -515,12 +515,14 @@ test('create options: admin names + assigns viewers; users get plain auto-create
     // A non-assigned user cannot see it (no oracle).
     assert.ok(!(await panel.req('GET', '/api/state', { cookie: alice })).json.machines.find((x) => x.name === 'reception-desk'), 'unassigned user does not see it');
 
-    // Resources shared by default; admin can opt a machine into caps (cap:true).
-    assert.equal(seen.capped, false, 'default machine is shared (uncapped)');
-    const capped = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop', name: 'capped-desk', cap: true } });
-    assert.equal(capped.status, 202);
-    const cState = (await panel.req('GET', '/api/state', { cookie: admin })).json.machines.find((x) => x.name === 'capped-desk');
-    assert.equal(cState.capped, true, 'cap:true → machine reports capped');
+    // Resources are CAPPED by default (config.capResources defaults true: the VM
+    // has no swap, so an uncapped machine can OOM the whole VM). An admin can
+    // still opt a specific machine out with cap:false.
+    assert.equal(seen.capped, true, 'default machine is capped');
+    const shared = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop', name: 'shared-desk', cap: false } });
+    assert.equal(shared.status, 202);
+    const sState = (await panel.req('GET', '/api/state', { cookie: admin })).json.machines.find((x) => x.name === 'shared-desk');
+    assert.equal(sState.capped, false, 'cap:false → machine reports uncapped');
 
     // Validation: duplicate name → 409, invalid name → 400, unknown viewer → 400.
     assert.equal((await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop', name: 'reception-desk' } })).status, 409, 'duplicate name → 409');

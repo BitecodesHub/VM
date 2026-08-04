@@ -13,9 +13,10 @@ import {
   mapContainerToCard, buildRunArgs, parseColimaList, listTemplates,
   filterMachinesForUser, quotaUsage, pickLanAddress, USER_RUNNING_LIMIT, isPanelMachine,
   machineAccess, canUse, canDelete, canManageAccess, quotaExceeded, QUOTA_STATES,
+  backendAuthFor, networkNameFor,
 } from './lib/core.js';
 import { loadConfig } from './lib/config.js';
-import { ensureDataDir, ensureSecret } from './lib/store.js';
+import { ensureDataDir, ensureSecret, acquireInstanceLock } from './lib/store.js';
 import { UserStore } from './lib/users.js';
 import { SessionStore } from './lib/sessions.js';
 import { ShareStore } from './lib/shares.js';
@@ -49,8 +50,48 @@ const TIMEOUTS = { read: 5000, mutate: 60000, colima: 300000, stats: 15000 };
 let VERSION = '0.0.0';
 try { VERSION = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8')).version || VERSION; } catch { /* keep default */ }
 
+// BUILD identity — the commit actually running, so deployment drift is visible.
+//
+// package.json has said "1.0.0" for every commit ever made, so a deployed tree
+// seven commits behind HEAD reported an identical version to HEAD and an operator
+// had no way to tell. (That was the real state of production: it ran a build from
+// six days earlier, missing crash-safety fixes, and nothing surfaced it.)
+//
+// Resolution order: an explicit VMP_BUILD_SHA from the deploy, else a BUILD_INFO
+// file written by deploy.sh, else git if this is a checkout, else 'unknown'.
+function resolveBuild() {
+  if (process.env.VMP_BUILD_SHA) return { sha: process.env.VMP_BUILD_SHA.slice(0, 12), source: 'env' };
+  try {
+    const info = JSON.parse(fs.readFileSync(path.join(__dirname, 'BUILD_INFO.json'), 'utf8'));
+    if (info?.sha) return { sha: String(info.sha).slice(0, 12), source: 'build-info', builtAt: info.builtAt || null, branch: info.branch || null };
+  } catch { /* not a deployed artifact */ }
+  try {
+    const head = fs.readFileSync(path.join(__dirname, '.git', 'HEAD'), 'utf8').trim();
+    const ref = head.startsWith('ref: ') ? head.slice(5) : null;
+    const sha = ref
+      ? fs.readFileSync(path.join(__dirname, '.git', ref), 'utf8').trim()
+      : head;
+    return { sha: sha.slice(0, 12), source: 'git', branch: ref ? ref.replace('refs/heads/', '') : null };
+  } catch { /* not a git checkout */ }
+  return { sha: 'unknown', source: 'none' };
+}
+const BUILD = resolveBuild();
+
 // ---- Boot: config + stores -------------------------------------------------
 ensureDataDir(DATA_DIR);
+// Refuse to run a second instance against the same data directory — two panels
+// clobber users/sessions/shares last-writer-wins and double every per-process
+// limit (quotas, socket ceiling, SSO replay guard). Fail fast and loudly rather
+// than corrupt state; a stale lock from a crashed process is reclaimed
+// automatically. Tests spawn panels with their own VMP_DATA_DIR, so they are
+// unaffected.
+let instanceLock = null;
+try {
+  instanceLock = acquireInstanceLock(DATA_DIR);
+} catch (e) {
+  if (e.code === 'VMP_LOCKED') { console.error(`[VMP_FATAL] ${e.message}`); process.exit(1); }
+  throw e;
+}
 const config = loadConfig(DATA_DIR);
 
 // Tagged, alerted, bounded exit for any fatal condition. launchd
@@ -121,7 +162,11 @@ const ssoGuard = new OneTimeGuard();
 function clientIp(req) {
   const peer = req?.socket?.remoteAddress || '';
   const loopback = peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
-  if (loopback) {
+  // Only honour X-Forwarded-For when a TLS front is actually deployed. Without
+  // publicTls there is no legitimate reverse proxy, so any XFF value is pure
+  // spoofing surface: it would mint a fresh rate-limit bucket per request and
+  // forge the source IP recorded in the audit log.
+  if (loopback && config.publicTls) {
     const xff = req?.headers?.['x-forwarded-for'];
     if (xff) {
       const hops = String(xff).split(',').map((s) => s.trim()).filter(Boolean);
@@ -139,6 +184,12 @@ const loginLimiter = new LoginLimiter();
 // delete, uploads, VM control). 60/min is far above human use but caps a runaway
 // or compromised client from flooding the docker CLI or filling the disk.
 const actionLimiter = new RateLimiter({ windowMs: 60_000, limit: config.actionRateLimit });
+// Failed /api/ext/* bearer attempts per client IP. Without this the ext API is a
+// single static credential an attacker can guess at network speed, unaudited.
+const extFailureLimiter = new RateLimiter({
+  windowMs: config.panelApiFailureWindowMinutes * 60_000,
+  limit: config.panelApiMaxFailures,
+});
 setInterval(() => sessions.sweep(), 10 * 60 * 1000).unref?.();
 
 // Public HTTPS origins served by the Caddy TLS front (additive — direct HTTP on
@@ -182,9 +233,31 @@ function closeMachineConn(name) { const e = machineActivity.get(name); if (e) { 
 
 // Once-a-minute maintenance: usage accounting (machine-minutes per owner) plus
 // idle-desktop reaping. Fires 60s after boot, so all module state is initialised.
+let maintenanceRunning = false;
 async function maintenanceTick() {
-  let byName;
-  try { ({ byName } = await cardsCached()); } catch { return; }
+  // Reentrancy guard. The tick fires every 60s but can take ~25s worst case
+  // (cards + docker stats + disk), and a wedged docker child made it far longer.
+  // Overlapping ticks DOUBLE-BILL machine-minutes to owners, silently inflating
+  // the usage ledger that chargeback reads.
+  if (maintenanceRunning) {
+    console.error('[VMP] maintenance tick still running after 60s — skipping this cycle');
+    return;
+  }
+  maintenanceRunning = true;
+  try {
+    await maintenanceTickInner();
+  } finally {
+    maintenanceRunning = false;
+  }
+}
+
+async function maintenanceTickInner() {
+  let byName, stale;
+  try { ({ byName, stale } = await cardsCached()); } catch { return; }
+  // Never bill or reap from a stale snapshot: the machines it lists may already be
+  // stopped, so usage would accrue against dead containers and the idle reaper
+  // could stop a machine someone is actually using.
+  if (stale) return;
   const idleMs = config.idleStopMinutes > 0 ? config.idleStopMinutes * 60_000 : 0;
   const now = Date.now();
   for (const card of byName.values()) {
@@ -233,18 +306,60 @@ function currentAlerts() {
   return deriveAlerts(metrics.latest(), { backupAgeMs: backupAgeMs() });
 }
 
-// Fire a webhook/log once when a critical alert first appears; clear when resolved.
+// Notify on first appearance, then re-notify no more often than the cooldown.
+//
+// Two changes from the original behaviour:
+//  - WARNINGS are notified too. Previously only criticals reached the webhook, so
+//    a stale backup, an unhealthy container and disk 85-94% were computed, shown
+//    in the UI, and otherwise reached nobody. Those are exactly the conditions
+//    that are cheap to fix early and expensive to discover late.
+//  - A flapping condition cannot spam. `firedAlerts` cleared the moment an alert
+//    resolved, so a VM flapping every minute re-fired every minute; the cooldown
+//    means at most one notification per alert id per window.
+const ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+const alertLastNotified = new Map();   // alert id -> epoch ms
+
 function evaluateAlerts() {
   const alerts = currentAlerts();
-  const critNow = new Set(alerts.filter((a) => a.level === 'critical').map((a) => a.id));
+  const idsNow = new Set(alerts.map((a) => a.id));
+  const now = Date.now();
   for (const a of alerts) {
-    if (a.level === 'critical' && !firedAlerts.has(a.id)) { firedAlerts.add(a.id); notifyCritical(a); }
+    const last = alertLastNotified.get(a.id) || 0;
+    const isNew = !firedAlerts.has(a.id);
+    if (isNew || now - last >= ALERT_COOLDOWN_MS) {
+      firedAlerts.add(a.id);
+      alertLastNotified.set(a.id, now);
+      notifyAlert(a);
+    } else {
+      firedAlerts.add(a.id);
+    }
   }
-  for (const id of [...firedAlerts]) if (!critNow.has(id)) firedAlerts.delete(id);
+  // Forget resolved alerts so recurrence is reported again — but keep the
+  // last-notified timestamp, which is what actually enforces the cooldown across
+  // a flap. Prune those timestamps once they are far older than the cooldown.
+  for (const id of [...firedAlerts]) if (!idsNow.has(id)) firedAlerts.delete(id);
+  for (const [id, at] of alertLastNotified) {
+    if (!idsNow.has(id) && now - at > ALERT_COOLDOWN_MS * 2) alertLastNotified.delete(id);
+  }
 }
-function notifyCritical(a) {
-  console.error(`[VMP_ALERT] ${new Date().toISOString()} CRITICAL ${a.id}: ${a.title}`);
-  try { fs.appendFileSync(path.join(DATA_DIR, 'alerts.jsonl'), JSON.stringify({ at: new Date().toISOString(), ...a }) + '\n', { mode: 0o600 }); } catch { /* ignore */ }
+// alerts.jsonl was the only append-only file with no cap or rotation (audit.jsonl
+// trims, panel-access.log rotates). Keep one previous generation so history stays
+// available without letting a long-running flap fill the disk.
+const ALERTS_LOG_MAX_BYTES = 1_000_000;
+function appendAlertLog(entry) {
+  const file = path.join(DATA_DIR, 'alerts.jsonl');
+  try {
+    try {
+      if (fs.statSync(file).size >= ALERTS_LOG_MAX_BYTES) fs.renameSync(file, `${file}.1`);
+    } catch { /* no file yet, or rename raced — append anyway */ }
+    fs.appendFileSync(file, JSON.stringify(entry) + '\n', { mode: 0o600 });
+  } catch { /* alerting must never break the caller */ }
+}
+
+function notifyAlert(a) {
+  const level = (a.level || 'warning').toUpperCase();
+  console.error(`[VMP_ALERT] ${new Date().toISOString()} ${level} ${a.id}: ${a.title}`);
+  appendAlertLog({ at: new Date().toISOString(), ...a });
   if (config.alertWebhook) {
     fetch(config.alertWebhook, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text: `VM Panel alert: ${a.title}` }), signal: AbortSignal.timeout(5000) }).catch(() => {});
   }
@@ -292,11 +407,44 @@ function releaseQuota(u, token) {
 }
 
 // ---- CLI helper ------------------------------------------------------------
+// Grace between execFile's own SIGTERM and our SIGKILL escalation.
+const CHILD_KILL_GRACE_MS = 5_000;
+
+// Run a CLI child with a HARD deadline.
+//
+// execFile's `timeout` sends `killSignal` (SIGTERM) and never escalates. A child
+// blocked in an uninterruptible state — the docker CLI waiting on a wedged
+// vsock/9p socket, or colima holding the VM lock — therefore never exits, its
+// callback never fires, and this promise never settles. Because getState parks
+// every caller on one shared in-flight promise, a single wedged child used to
+// hang every API request and every new screen session indefinitely, while the
+// process stayed alive and /healthz kept answering 200 — so no supervisor could
+// see it and nothing recovered without a manual restart.
+//
+// The escalation timer guarantees this promise always settles.
 function run(bin, args, timeout) {
   return new Promise((resolve) => {
-    execFile(bin, args, { timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ ok: !err, stdout: stdout || '', stderr: stderr || '', code: err?.code });
+    let settled = false;
+    let hardKill = null;
+    const done = (v) => {
+      if (settled) return;
+      settled = true;
+      if (hardKill) clearTimeout(hardKill);
+      resolve(v);
+    };
+    const child = execFile(bin, args, { timeout, maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      done({ ok: !err, stdout: stdout || '', stderr: stderr || '', code: err?.code });
     });
+    if (timeout > 0) {
+      hardKill = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* already gone */ }
+        console.error(`[VMP_CHILD_KILLED] ${bin} ${args[0] || ''} ignored SIGTERM after ${timeout}ms — SIGKILLed`);
+        // Reported as a deadline so isDockerDown() classifies it as the daemon
+        // being unreachable, which is what a wedged docker CLI actually means.
+        done({ ok: false, stdout: '', stderr: `context deadline exceeded: ${bin} did not exit within ${timeout}ms`, code: 'ETIMEDOUT_HARD' });
+      }, timeout + CHILD_KILL_GRACE_MS);
+      hardKill.unref?.();
+    }
   });
 }
 function isDockerDown(stderr) {
@@ -325,21 +473,36 @@ async function inspectCards() {
 }
 
 // ---- Generic single-flight TTL cache ---------------------------------------
-function ttlCache(ttl, fetcher) {
-  let at = 0, value = null, promise = null;
+// On a failed refresh the last good value is retained and reported as `stale`,
+// so a brief docker blip does not blank the UI. `staleGraceMs` bounds that: past
+// it the value is dropped entirely, because serving a snapshot of unbounded age
+// as though it were current is worse than admitting we do not know — a
+// docker-daemon outage used to show green cards for dead machines indefinitely.
+// `failAt` gives short negative caching so every request during an outage does
+// not pay the full docker timeout again.
+function ttlCache(ttl, fetcher, { staleGraceMs = 60_000, negativeTtlMs = 1_000 } = {}) {
+  let at = 0, value = null, promise = null, failAt = 0;
   return {
     async get() {
-      if (value !== null && Date.now() - at < ttl) return { value, stale: false, at };
+      const now = Date.now();
+      if (value !== null && now - at < ttl) return { value, stale: false, at };
+      // Recent failure: return what we have (flagged stale) without re-dialling.
+      if (!promise && failAt && now - failAt < negativeTtlMs) {
+        return { value, stale: true, at };
+      }
       if (!promise) {
         promise = fetcher()
-          .then((v) => { value = v; at = Date.now(); return v; })
-          .catch(() => null)
+          .then((v) => { value = v; at = Date.now(); failAt = 0; return v; })
+          .catch(() => { failAt = Date.now(); return null; })
           .finally(() => { promise = null; });
       }
       const fresh = await promise;
+      if (fresh === null && value !== null && Date.now() - at > staleGraceMs) {
+        value = null; at = 0;                 // too old to be trustworthy
+      }
       return { value, stale: fresh === null, at };
     },
-    invalidate() { at = 0; },
+    invalidate() { at = 0; failAt = 0; },
   };
 }
 
@@ -349,9 +512,13 @@ const cardsCacheImpl = ttlCache(5000, async () => {
   const cards = await inspectCards();
   return { ok: true, byName: new Map(cards.map((c) => [c.name, c])) };
 });
+// Propagates `stale` — callers that report health (getState) must be able to tell
+// "docker answered" from "docker did not, this is the last thing we saw". Dropping
+// it here made a docker-daemon outage indistinguishable from a healthy VM.
 async function cardsCached() {
-  const { value } = await cardsCacheImpl.get();
-  return value || { ok: false, byName: new Map() };
+  const { value, stale, at } = await cardsCacheImpl.get();
+  if (!value) return { ok: false, byName: new Map(), stale: true, at: 0 };
+  return { ...value, stale, at };
 }
 async function resolveMachineCached(name) {
   const { byName } = await cardsCached();
@@ -431,7 +598,7 @@ async function getState(user) {
       ? lastVmResult
       : { kind: lastVmResult.kind, ok: false, timedOut: lastVmResult.timedOut, at: lastVmResult.at };
   }
-  const panel = { port: config.port, machinePort, lanHost: config.lanHost || pickLanAddress(os.networkInterfaces()), tls: config.publicTls, publicHost: config.publicHost, panelHttpsPort: config.panelHttpsPort, machineHttpsPort: config.machineHttpsPort, hostWebcam, secureContext: !!config.publicTls, version: VERSION };
+  const panel = { port: config.port, machinePort, lanHost: config.lanHost || pickLanAddress(os.networkInterfaces()), tls: config.publicTls, publicHost: config.publicHost, panelHttpsPort: config.panelHttpsPort, machineHttpsPort: config.machineHttpsPort, hostWebcam, secureContext: !!config.publicTls, version: VERSION, build: BUILD.sha, buildSource: BUILD.source, branch: BUILD.branch || null };
   const sharedNames = sharedSetFor(user);
 
   const wrap = (cards, stale, dockerReachable) => {
@@ -459,15 +626,29 @@ async function getState(user) {
     // request — the SPA polls every 4s, so ~30-40 clients would otherwise fan out
     // into a docker-inspect storm on the event loop. Lifecycle mutations call
     // invalidateMachineCache() so user actions still reflect immediately.
-    const { ok, byName } = await cardsCached();
+    const { ok, byName, stale } = await cardsCached();
     if (!ok) return wrap(lastMachines, true, false);
     const cards = [...byName.values()].filter(isPanelMachine); // panel machines only
+    // A stale snapshot must be REPORTED as stale. Previously `ok` was true
+    // whenever any cached value existed, so a docker-daemon outage kept serving
+    // an aging snapshot as "fresh and reachable" — users saw green cards for dead
+    // machines and no vm-down alert ever fired.
+    if (stale) return wrap(cards.length ? cards : lastMachines, true, false);
     lastMachines = cards;
-    // Prune shares whose machine no longer exists — ONLY on the trustworthy
-    // fresh path (never from stale/empty state).
+    // Prune shares/display names whose machine no longer exists — ONLY on the
+    // trustworthy fresh path.
+    //
+    // An EMPTY fresh list is deliberately not treated as authoritative: docker
+    // answers normally after a VM rebuild or `docker system prune`, and sweeping
+    // on that would permanently delete every sharing ACL and display name (and
+    // machine-meta is not in the backup set). A stale ACL for a machine that no
+    // longer exists is harmless by comparison — it is re-pruned as soon as any
+    // machine exists again.
     const liveNames = new Set(cards.map((c) => c.name));
-    shares.sweep(liveNames).catch(() => {});
-    machineMeta.sweep(liveNames).catch(() => {});
+    if (liveNames.size) {
+      shares.sweep(liveNames).catch(() => {});
+      machineMeta.sweep(liveNames).catch(() => {});
+    }
     return wrap(cards, false, true);
   } catch (e) {
     if (e instanceof DockerDownError) return wrap(lastMachines, true, false);
@@ -566,7 +747,21 @@ async function createMachine(user, template, opts = {}) {
       try { ports = await allocatePorts(template, usedBase); }
       catch { return { status: 503, body: { error: { code: 'PORT_ALLOC_FAILED', message: 'no free port in range' } } }; }
       try {
-        const args = buildRunArgs({ template, name, ports, createdAt: new Date().toISOString(), owner: username, webdriverBind, cap, hostWebcam: webcam });
+        // Per-machine network so this container cannot reach any other machine.
+        // Best-effort: if creation fails the machine still comes up (on the
+        // default bridge), but we log it loudly because it loses isolation.
+        // NOT --internal: these desktops need outbound internet (that is the
+        // point of a browser desktop). A plain per-machine bridge still isolates
+        // machines from each other, because each is alone on its own network.
+        const network = networkNameFor(name);
+        const netRes = await run(DOCKER, ['network', 'create', network], TIMEOUTS.mutate);
+        const netOk = netRes.ok || /already exists/i.test(netRes.stderr || '');
+        if (!netOk) console.error(`[VMP] ${name}: per-machine network create failed — falling back to the default bridge (containers will NOT be isolated from each other): ${tail(netRes.stderr)}`);
+        const args = buildRunArgs({
+          template, name, ports, createdAt: new Date().toISOString(), owner: username,
+          webdriverBind, cap, hostWebcam: webcam, authSecret: SECRET,
+          network: netOk ? network : null,
+        });
         const r = await run(DOCKER, args, TIMEOUTS.mutate);
         if (r.ok) {
           invalidateMachineCache();
@@ -658,6 +853,13 @@ async function rmContainer(name) {
   await run(DOCKER, ['stop', '-t', '10', name], TIMEOUTS.mutate);
   let r = await run(DOCKER, ['rm', name], TIMEOUTS.mutate);
   if (!r.ok) r = await run(DOCKER, ['rm', '-f', name], TIMEOUTS.mutate);
+  // Reap the machine's dedicated network. Best-effort and always after the
+  // container is gone (docker refuses to remove a network still in use); a leaked
+  // network is harmless but would accumulate, so failures are logged only.
+  const netRes = await run(DOCKER, ['network', 'rm', networkNameFor(name)], TIMEOUTS.mutate);
+  if (!netRes.ok && !/not found|no such network/i.test(netRes.stderr || '')) {
+    console.error(`[VMP] ${name}: could not remove per-machine network: ${tail(netRes.stderr)}`);
+  }
   return r.ok;
 }
 
@@ -754,12 +956,27 @@ function uploadMachineFile(user, name, filename, req, res) {
     const tmp = tmpPath('up');
     const ws = fs.createWriteStream(tmp, { mode: 0o600 });
     let size = 0, aborted = false;
-    const cleanup = () => { try { fs.unlinkSync(tmp); } catch { /* ignore */ } };
+    // cleanup MUST destroy the write stream before unlinking. Unlinking a file
+    // that is still open leaves the blocks allocated but unreachable for the
+    // life of the process (invisible to du, and it keeps an fd), so a client that
+    // repeatedly aborts a large upload used to leak both disk and descriptors
+    // until the panel restarted — ending in EMFILE, which is a fatal error path.
+    const cleanup = () => {
+      if (!ws.destroyed) ws.destroy();
+      try { fs.unlinkSync(tmp); } catch { /* already gone */ }
+    };
     req.on('data', (c) => {
       size += c.length;
-      if (size > UPLOAD_LIMIT && !aborted) { aborted = true; req.destroy(); ws.destroy(); cleanup(); if (!res.headersSent) sendJson(res, 413, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'file too large (max 200 MB)' } }); }
+      if (size > UPLOAD_LIMIT && !aborted) { aborted = true; req.destroy(); cleanup(); if (!res.headersSent) sendJson(res, 413, { error: { code: 'PAYLOAD_TOO_LARGE', message: 'file too large (max 200 MB)' } }); }
     });
-    req.on('error', cleanup);
+    // Client-disconnect cases that never emit 'error' (a half-close mid-body
+    // raised neither, so the temp file and its fd survived). `req.complete` is
+    // the discriminator: it is true once the full body has been received, so a
+    // 'close' after a SUCCESSFUL read must not be treated as an abort — doing so
+    // cancels the upload and leaves the request unanswered.
+    const abandon = () => { if (!aborted) { aborted = true; cleanup(); } };
+    req.on('close', () => { if (!req.complete) abandon(); });
+    req.on('error', abandon);
     ws.on('error', () => { cleanup(); if (!res.headersSent) sendJson(res, 500, { error: { code: 'IO', message: 'write failed' } }); });
     ws.on('finish', async () => {
       if (aborted) return;
@@ -784,10 +1001,24 @@ async function downloadMachineFile(user, name, filename, res) {
   const dir = uploadDirFor(resolved.card);
   const tmp = tmpPath('dn');
   const cp = await run(DOCKER, ['cp', `${name}:${dir}/${filename}`, tmp], 180_000);
-  let stat = null; try { stat = fs.statSync(tmp); } catch { /* missing */ }
-  if (!cp.ok || !stat || !stat.isFile()) { try { fs.unlinkSync(tmp); } catch { /* ignore */ } return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such file' } }); }
+  // `docker cp` without -L copies a SYMLINK AS A SYMLINK, so a user who can write
+  // their own upload dir could point one at a host path (data/secret,
+  // data/sessions.json) and have the panel materialise, then serve, that file.
+  // lstat (which does NOT follow links) is therefore the only safe check here:
+  // statSync/createReadStream both follow, so the old stat().isFile() guard
+  // passed for a symlink to any readable host file. Reject anything that is not
+  // a plain regular file, and open with O_NOFOLLOW so the read cannot be
+  // re-pointed between the check and the open.
+  let lst = null; try { lst = fs.lstatSync(tmp); } catch { /* missing */ }
+  const isPlainFile = !!lst && lst.isFile() && !lst.isSymbolicLink();
+  if (!cp.ok || !isPlainFile) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    if (lst && !isPlainFile) console.error(`[VMP] refused non-regular download from ${name}: ${filename} (possible symlink escape attempt by ${user.username})`);
+    return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such file' } });
+  }
+  const stat = lst;
   res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': stat.size, 'Content-Disposition': `attachment; filename="${filename.replace(/["\\]/g, '')}"`, 'Cache-Control': 'no-store', ...SEC_HEADERS });
-  const rs = fs.createReadStream(tmp);
+  const rs = fs.createReadStream(tmp, { flags: fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW });
   rs.pipe(res);
   const done = () => { try { fs.unlinkSync(tmp); } catch { /* ignore */ } };
   rs.on('close', done); rs.on('error', () => { done(); res.destroy(); });
@@ -1179,7 +1410,11 @@ if (config.accessLog) {
 }
 function accessLog(remote, user, method, rawUrl, status, ms) {
   if (!logStream) return;
-  const safeUrl = rawUrl.replace(/([?&](password|token)=)[^&]*/gi, '$1***');
+  // Redact every credential-bearing query parameter. `t` is the single-use SSO
+  // token on /sso?t=... — it was previously written to the log verbatim, so
+  // anyone who could read the log (or a backup, or a log shipper) could redeem a
+  // still-live token. `password` is the noVNC query password for Selenium nodes.
+  const safeUrl = rawUrl.replace(/([?&](password|token|t)=)[^&]*/gi, '$1***');
   const line = `${new Date().toISOString()} ${remote} ${user || '-'} ${method} ${safeUrl} ${status} ${ms}ms\n`;
   logStream.write(line);
   logBytes += Buffer.byteLength(line);
@@ -1204,7 +1439,14 @@ const server = http.createServer(async (req, res) => {
     const method = req.method;
 
     // Health check — unauthenticated, before host guard (leaks nothing).
-    if (method === 'GET' && rawPath === '/healthz') return sendJson(res, 200, { ok: true });
+    // Liveness: the process is running and its event loop is turning. Never
+    // touches a dependency, so a supervisor cannot be told to restart the panel
+    // because docker is down.
+    if (method === 'GET' && rawPath === '/healthz') return sendJson(res, 200, { ok: true, pid: process.pid, version: VERSION, build: BUILD.sha, uptimeSec: Math.round(process.uptime()) });
+    // Readiness: can the panel actually serve machines right now? An external
+    // monitor should watch THIS, because /healthz answered 200 even when a wedged
+    // docker child had made every real request hang forever.
+    if (method === 'GET' && rawPath === '/readyz') return await handleReadyz(res);
 
     // Host guard (DNS-rebinding protection) on every request.
     if (!isAllowedHost(req.headers.host, config.port, EXTRA_HOSTS)) {
@@ -1288,6 +1530,14 @@ const server = http.createServer(async (req, res) => {
     }
     if (rawPath === '/api/me' && method === 'GET') return sendJson(res, 200, meBody(auth.fullUser));
     if (rawPath === '/api/me/password' && method === 'PATCH') return await handleChangePassword(req, res, auth);
+
+    // A machine-scoped SSO/embed session exists only to view ONE desktop inside
+    // PRISM. It must not reach the panel API at all: cookies are not port-scoped,
+    // so without this gate the embed cookie set on the machine origin
+    // authenticated every admin route on the panel origin.
+    if (auth.session?.machine) {
+      return sendJson(res, 403, { error: { code: 'EMBED_SESSION_SCOPED', message: 'This sign-in is scoped to a single desktop and cannot use the panel API.' } });
+    }
 
     // mustChangePassword gate — everything else blocked until changed.
     if (auth.fullUser.mustChangePassword) {
@@ -1485,10 +1735,66 @@ function extAuthOk(req) {
   return constantTimeEq(token, config.panelApiToken);
 }
 
+// Optional network gate for /api/ext/*. Built once at boot from
+// config.panelApiAllowFrom; entries are exact IPs or CIDR blocks, IPv4 or IPv6.
+// net.BlockList does the address-family and prefix arithmetic for us.
+const extAllowList = (() => {
+  const list = config.panelApiAllowFrom || [];
+  if (!list.length) return null;                       // null = no IP restriction
+  const bl = new net.BlockList();
+  for (const entry of list) {
+    const slash = entry.indexOf('/');
+    try {
+      if (slash === -1) {
+        bl.addAddress(entry, net.isIPv6(entry) ? 'ipv6' : 'ipv4');
+      } else {
+        const base = entry.slice(0, slash);
+        const bits = parseInt(entry.slice(slash + 1), 10);
+        bl.addSubnet(base, bits, net.isIPv6(base) ? 'ipv6' : 'ipv4');
+      }
+    } catch (e) {
+      console.error(`[VMP] config: ignoring invalid panelApiAllowFrom entry "${entry}": ${e.message}`);
+    }
+  }
+  return bl;
+})();
+
+function extIpAllowed(req) {
+  if (!extAllowList) return true;
+  const ip = clientIp(req);
+  if (!ip) return false;
+  // An IPv4-mapped peer (::ffff:10.0.0.1) must satisfy an IPv4 rule.
+  const bare = ip.replace(/^::ffff:/i, '');
+  if (net.isIPv4(bare) && extAllowList.check(bare, 'ipv4')) return true;
+  if (net.isIPv6(ip) && extAllowList.check(ip, 'ipv6')) return true;
+  return false;
+}
+
 async function handleExtApi(req, res, rawPath, method) {
   // Feature-off looks like a non-existent endpoint (leaks nothing about config).
   if (!config.panelApiToken) return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such endpoint' } });
-  if (!extAuthOk(req)) { res.setHeader('WWW-Authenticate', 'Bearer'); return sendJson(res, 401, { error: { code: 'UNAUTHENTICATED', message: 'bearer token required' } }); }
+  // Network gate first: an out-of-scope caller never even reaches the credential.
+  if (!extIpAllowed(req)) {
+    recordAudit(req, 'prism', 'ext.auth.blocked', null, { reason: 'ip_not_allowed' });
+    return sendJson(res, 403, { error: { code: 'FORBIDDEN', message: 'not permitted from this address' } });
+  }
+  // Bearer failures are budgeted per IP *and* audited, so brute force is both
+  // slow and visible. The budget is only consumed by FAILURES, so a correctly
+  // configured caller is never throttled.
+  const extKey = `ext:${clientIp(req) || 'unknown'}`;
+  if (!extAuthOk(req)) {
+    const gate = extFailureLimiter.hit(extKey);
+    recordAudit(req, 'prism', 'ext.auth.failed', null, {
+      path: rawPath, method, throttled: !gate.allowed,
+      presented: req.headers.authorization ? 'bearer' : 'none',
+    });
+    if (!gate.allowed) {
+      res.setHeader('Retry-After', String(Math.ceil(gate.retryAfterMs / 1000)));
+      return sendJson(res, 429, { error: { code: 'RATE_LIMITED', message: 'too many failed attempts' } });
+    }
+    res.setHeader('WWW-Authenticate', 'Bearer');
+    return sendJson(res, 401, { error: { code: 'UNAUTHENTICATED', message: 'bearer token required' } });
+  }
   const sub = rawPath.slice('/api/ext'.length);
   let m;
 
@@ -1520,7 +1826,15 @@ async function handleExtApi(req, res, rawPath, method) {
     if (!body) return sendJson(res, 400, EXT_BAD_JSON);
     const username = String(body.username || '').toLowerCase();
     if (!validateUsername(username)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid username (3–32 lowercase letters/digits/_/-, starts with a letter)' } });
-    const role = body.role === 'admin' ? 'admin' : 'user';
+    // The ext API provisions CONTRACTOR accounts only. It must never be able to
+    // mint an administrator: combined with /sso/mint that turned a single static
+    // bearer token into full panel takeover (create admin -> SSO -> admin session).
+    // Privilege grants stay a deliberate act in the panel UI by a human admin.
+    if (body.role !== undefined && body.role !== 'user') {
+      recordAudit(req, 'prism', 'ext.privilege.refused', username, { requestedRole: String(body.role).slice(0, 32) });
+      return sendJson(res, 403, { error: { code: 'ROLE_NOT_PERMITTED', message: 'the integration API can only provision standard users; grant admin in the panel UI' } });
+    }
+    const role = 'user';
     const existing = users.get(username);
     if (existing) return sendJson(res, 200, { ok: true, created: false, user: UserStore.publicUser(existing) });
     try {
@@ -1629,6 +1943,13 @@ async function handleExtApi(req, res, rawPath, method) {
     const user = users.get(username);
     if (!user) return sendJson(res, 404, { error: { code: 'USER_NOT_FOUND', message: 'no such user' } });
     if (user.disabled) return sendJson(res, 403, { error: { code: 'USER_DISABLED', message: 'user is disabled' } });
+    // Never mint an SSO session for an administrator. An SSO token bypasses the
+    // password (and any must-change gate) by design, so allowing it for an admin
+    // would let the bearer token escalate to full panel control.
+    if (user.role === 'admin') {
+      recordAudit(req, 'prism', 'ext.sso.refused', username, { reason: 'admin_account' });
+      return sendJson(res, 403, { error: { code: 'ROLE_NOT_PERMITTED', message: 'cannot mint single sign-on for an administrator account' } });
+    }
     const machine = body.machine ? String(body.machine) : null;
     if (machine && !validateName(machine)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid machine name' } });
     const ttlSec = Math.min(300, Math.max(15, parseInt(body.ttlSec, 10) || 60));
@@ -1654,7 +1975,12 @@ async function handleSsoRedeem(req, res, setUser) {
   if (!ssoGuard.claim(payload.jti, payload.exp)) return sendHtml(res, 401, errorPage(401, 'Link already used', 'This sign-in link was already used. Return to PRISM and open the desktop again.'));
   const user = users.get(payload.username);
   if (!user || user.disabled) return sendHtml(res, 403, errorPage(403, 'No access', 'This account cannot sign in.'));
-  const { setCookie } = await sessions.create(payload.username, { ip: clientIp(req), userAgent: req.headers['user-agent'], embed: true });
+  // Scope the session to the machine the link was minted for (when it named one),
+  // so this cookie cannot be replayed against the panel API or another desktop.
+  const { setCookie } = await sessions.create(payload.username, {
+    ip: clientIp(req), userAgent: req.headers['user-agent'], embed: true,
+    machine: payload.machine || null,
+  });
   setUser?.(payload.username);
   recordAudit(req, payload.username, 'sso.login', payload.machine || null, { via: 'prism-embed' });
   // Redirect into the machine's REAL viewer URL (card.uiUrl = autoconnect +
@@ -1679,11 +2005,76 @@ async function handleSsoRedeem(req, res, setUser) {
   }
   // No X-Frame-Options here: this 302 travels inside the PRISM iframe. The final
   // screen document's framing is governed by its CSP frame-ancestors allow-list.
-  res.writeHead(302, { Location: dest, 'Set-Cookie': setCookie, 'Cache-Control': 'no-store' });
+  // Referrer-Policy IS required: without it the request URL — which carries the
+  // single-use SSO token in ?t= — is sent as the Referer of every subresource the
+  // destination loads, handing the token to the machine backend.
+  res.writeHead(302, {
+    Location: dest,
+    'Set-Cookie': setCookie,
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+    'X-Content-Type-Options': 'nosniff',
+  });
   return res.end();
 }
 
+// Readiness probe. Unauthenticated (like /healthz) and deliberately terse — it
+// reports only whether the panel can do its job, never machine names or counts
+// beyond a total, so it is safe to expose to a monitor.
+//
+// Returns 200 only when the VM is up, docker answered, and the snapshot we would
+// serve is actually fresh. 503 otherwise, with a machine-readable `reason` so an
+// operator can tell "VM stopped" from "docker wedged" without reading logs.
+async function handleReadyz(res) {
+  const started = Date.now();
+  let vm = null;
+  try { vm = (await vmCache.get()).value; } catch { /* treated as unknown below */ }
+  const vmRunning = !!vm?.running;
+  let dockerOk = false, stale = true, sampleAgeMs = null, machines = null;
+  if (vmRunning) {
+    try {
+      const c = await cardsCached();
+      dockerOk = !!c.ok;
+      stale = !!c.stale;
+      sampleAgeMs = c.at ? Date.now() - c.at : null;
+      if (dockerOk) machines = [...c.byName.values()].filter(isPanelMachine).length;
+    } catch { dockerOk = false; }
+  }
+  const ready = vmRunning && dockerOk && !stale;
+  const reason = ready ? null
+    : !vmRunning ? 'vm_not_running'
+      : !dockerOk ? 'docker_unreachable'
+        : 'snapshot_stale';
+  return sendJson(res, ready ? 200 : 503, {
+    ok: ready, reason,
+    vm: { running: vmRunning, status: vm?.status ?? 'unknown', transition: vmTransition?.kind || null },
+    docker: { reachable: dockerOk, stale, sampleAgeMs },
+    machines,
+    version: VERSION,
+    build: BUILD.sha,
+    checkMs: Date.now() - started,
+  });
+}
+
 // ---- Route handlers --------------------------------------------------------
+
+// First-run admin claim. Two protections:
+//  1) setupInProgress is claimed SYNCHRONOUSLY before the first await, because
+//     users.create() awaits scrypt (~100ms). Two concurrent POST /api/setup
+//     requests both used to pass the isEmpty() check and both created an admin,
+//     leaving a second administrator the operator never saw.
+//  2) A non-loopback request must present SETUP_TOKEN, printed to the log at boot
+//     while the panel has no users. Setup from this machine needs no token (the
+//     documented flow), but a LAN peer cannot claim the account by racing the
+//     operator to a freshly installed panel.
+let setupInProgress = false;
+const SETUP_TOKEN = crypto.randomBytes(16).toString('base64url');
+
+function isLoopbackReq(req) {
+  const peer = req?.socket?.remoteAddress || '';
+  return peer === '127.0.0.1' || peer === '::1' || peer === '::ffff:127.0.0.1';
+}
+
 async function handleSetup(req, res, setUser) {
   if (!users.isEmpty()) return sendJson(res, 409, { error: { code: 'SETUP_ALREADY_DONE', message: 'setup already completed' } });
   const bad = guardMutation(req);
@@ -1694,8 +2085,19 @@ async function handleSetup(req, res, setUser) {
   if (!validateUsername(username)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'Username must be 3–32 lowercase letters, digits, _ or -, starting with a letter.' } });
   const pwErr = validatePassword(password);
   if (pwErr) return sendJson(res, 400, { error: { code: 'WEAK_PASSWORD', message: pwErr } });
-  if (!users.isEmpty()) return sendJson(res, 409, { error: { code: 'SETUP_ALREADY_DONE', message: 'setup already completed' } });
-  const user = await users.create({ username, password, role: 'admin', mustChangePassword: false });
+  if (!isLoopbackReq(req) && !constantTimeEq(String(body.setupToken || ''), SETUP_TOKEN)) {
+    recordAudit(req, username || '-', 'setup.refused', null, { reason: 'remote_without_token' });
+    return sendJson(res, 403, { error: { code: 'SETUP_TOKEN_REQUIRED', message: 'Remote first-run setup requires the setup token printed in the panel log at startup. Alternatively, complete setup from the machine running the panel.' } });
+  }
+  // Check + claim in one synchronous block — no await between them.
+  if (!users.isEmpty() || setupInProgress) return sendJson(res, 409, { error: { code: 'SETUP_ALREADY_DONE', message: 'setup already completed' } });
+  setupInProgress = true;
+  let user;
+  try {
+    user = await users.create({ username, password, role: 'admin', mustChangePassword: false });
+  } finally {
+    setupInProgress = false;   // on failure another attempt may proceed
+  }
   const { setCookie } = await sessions.create(username, { ip: clientIp(req), userAgent: req.headers['user-agent'] });
   setUser(username);
   recordAudit(req, username, 'setup', username, { role: 'admin' });
@@ -1858,7 +2260,12 @@ function panelFrameAncestors(req) {
 // (satisfied server-side so the embedded screen never prompts); noVNC is plain.
 function backendProxyOpts(card) {
   const t = TEMPLATES[card.template] || {};
-  return { backendTls: !!t.backendTls, backendAuth: t.backendAuth || null };
+  // Credentials are derived per machine from the panel secret; legacy containers
+  // (no vmpanel.authv label) fall back to the template constant.
+  return {
+    backendTls: !!t.backendTls,
+    backendAuth: backendAuthFor(t, { name: card.name, authV: card.authV || 1, secret: SECRET }),
+  };
 }
 
 // Pick the backend port + target path for a proxied request. Almost everything
@@ -1893,6 +2300,11 @@ async function handleProxy(req, res, setUser) {
 
   const parsed = parseProxyPath(req.url);
   if (!parsed) return sendHtml(res, 404, errorPage(404, 'Not found', 'That machine path is not valid.'));
+  // Machine-scoped embed session: only its own desktop. Same 404 as an unknown
+  // machine, so the response is not an existence oracle for other machines.
+  if (auth.session?.machine && auth.session.machine !== parsed.name) {
+    return sendHtml(res, 404, errorPage(404, 'Not found', 'That machine path is not valid.'));
+  }
   if (parsed.rest === null) {
     res.writeHead(302, { Location: `/m/${parsed.name}/${parsed.query}`, 'Cache-Control': 'no-store' });
     return res.end();
@@ -1931,6 +2343,10 @@ async function handleUpgrade(req, socket, head) {
     }
     const parsed = parseProxyPath(req.url);
     if (!parsed || parsed.rest === null) { socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroy(); return; }
+    // Machine-scoped embed session: refuse the websocket for any other machine.
+    if (auth.session?.machine && auth.session.machine !== parsed.name) {
+      socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n'); socket.destroy(); return;
+    }
     let card;
     try { card = await resolveMachineCached(parsed.name); } catch { card = null; }
     if (!card || !isPanelMachine(card) || !canUse(accessFor(auth.user, card)) || card.localOnly || !card.uiPort || card.state !== 'running') {
@@ -1982,8 +2398,23 @@ for (const s of [server, machineServer]) {
   s.headersTimeout = 10_000;
   s.requestTimeout = 120_000;
   s.keepAliveTimeout = 5_000;
+  // Bound concurrent sockets per origin. Without this an unauthenticated peer can
+  // hold open as many connections as the fd table allows; exhausting it surfaces
+  // as EMFILE on accept, which reaches the 'error' handler below and (being
+  // re-thrown) became an uncaughtException that killed the process and dropped
+  // every live screen. Well above real use: the SPA holds ~1 socket per client
+  // plus up to maxUpgradedSockets live screens.
+  s.maxConnections = Math.max(256, (config.maxUpgradedSockets || 64) * 8);
   s.on('error', (e) => {
     if (e.code === 'EADDRINUSE') { console.error(`Port in use (${config.port}/${machinePort}). Is VM Panel already running?`); process.exit(1); }
+    // Socket-level errors (EMFILE/ENFILE under fd pressure, ECONNABORTED) must
+    // NOT be re-thrown: that converts a transient, recoverable condition into a
+    // fatal uncaughtException. Log and keep serving; the fd pressure resolves as
+    // connections close, and maxConnections above makes it far less likely.
+    if (e.code === 'EMFILE' || e.code === 'ENFILE' || e.code === 'ECONNABORTED' || e.code === 'ECONNRESET') {
+      console.error(`[VMP] server socket error ${e.code} — continuing (connections: ${s.connections ?? '?'})`);
+      return;
+    }
     throw e;
   });
 }
@@ -2004,6 +2435,9 @@ async function shutdown() {
   // of session/usage/metrics data that was only scheduled to flush.
   try { await Promise.allSettled([sessions.flush(), usage.flush(), usageSessions.flush(), metrics.flush()]); } catch { /* best-effort */ }
   logStream?.end();
+  // Release AFTER the flushes: while they are in flight this process is still the
+  // legitimate writer, so the lock must stand.
+  try { instanceLock?.release(); } catch { /* best effort */ }
   process.exit(0);
 }
 process.on('SIGTERM', shutdown);
@@ -2029,7 +2463,15 @@ server.listen(config.port, config.bind, () => {
     console.log(`VM Panel on http://${config.bind}:${bound}` + (lan ? `  (LAN: http://${lan}:${bound})` : ''));
     console.log(`Machine screens on port ${machinePort}`);
     console.log(`VMP_LISTENING port=${bound} machinePort=${machinePort}`);
-    if (users.isEmpty()) console.log('First run: open the panel to create your admin account.');
+    // Log the running build so "which code is live?" is answerable from the log
+    // alone — previously the only way to tell was to hash server.js against every
+    // commit.
+    console.log(`VMP_BUILD version=${VERSION} commit=${BUILD.sha} source=${BUILD.source}${BUILD.branch ? ` branch=${BUILD.branch}` : ''}`);
+    if (users.isEmpty()) {
+      console.log('First run: open the panel ON THIS MACHINE to create your admin account.');
+      console.log(`First run from another device requires this one-time setup token: ${SETUP_TOKEN}`);
+      console.log('  (send it as {"setupToken":"..."} with the setup request; it changes on every restart)');
+    }
     reattachBrowserSessions().catch(() => {}); // re-adopt live browsers after a restart
     try { sweepStale(os.tmpdir(), 'vmp-', 60 * 60 * 1000); } catch { /* best-effort */ } // clear crashed-upload scratch
   });
