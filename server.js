@@ -720,7 +720,11 @@ async function createMachine(user, template, opts = {}) {
   // Global capacity ceiling (system-wide, all owners — admins included). Protects
   // the host from oversubscription when resources are shared by default.
   if (config.maxRunningMachines > 0 && runningPlusPending(cards) >= config.maxRunningMachines) {
-    return { status: 503, body: { error: { code: 'AT_CAPACITY', message: `The system is at capacity (${config.maxRunningMachines} machines running). Ask a colleague to stop one, or try again shortly.` } } };
+    // Report the actual count AND the limit. This previously interpolated the
+    // limit alone as though it were the count ("2 machines running" when the limit
+    // was 2), which reads as a status report and hides what the ceiling is —
+    // actively misleading while diagnosing a refused create.
+    return { status: 503, body: { error: { code: 'AT_CAPACITY', message: `The system is at capacity (${runningPlusPending(cards)} of ${config.maxRunningMachines} machines running). Ask a colleague to stop one, or try again shortly.` } } };
   }
 
   // Synchronous quota check + reserve (atomic on the single-threaded loop).
@@ -818,7 +822,7 @@ async function lifecycle(user, name, action) {
 
   // Starting counts against the system-wide ceiling too (admins included).
   if (action === 'start' && config.maxRunningMachines > 0 && runningPlusPending(cards) >= config.maxRunningMachines) {
-    return { status: 503, body: { error: { code: 'AT_CAPACITY', message: `The system is at capacity (${config.maxRunningMachines} machines running). Stop one first, or try again shortly.` } } };
+    return { status: 503, body: { error: { code: 'AT_CAPACITY', message: `The system is at capacity (${runningPlusPending(cards)} of ${config.maxRunningMachines} machines running). Stop one first, or try again shortly.` } } };
   }
 
   // Starting a stopped machine consumes a quota slot charged to the OWNER (not

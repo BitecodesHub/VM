@@ -64,17 +64,22 @@ one-time password shown once and must change it on first login.
 
 ### Creating a machine
 
-Five templates, chosen at create time:
+Four templates, chosen at create time. (Both Linux desktops are KasmVNC-based, so
+speaker and microphone work on either — there is no separate "Media" template;
+camera is off by default because Kasm's webcam service burns ~1 vCPU per desktop
+against an idle device.)
 
-| Template | Image | Memory cap |
-|----------|-------|-----------|
-| Linux Desktop — Modern (XFCE) *(recommended)* | `minimal-linux-desktop:xfce` | 1.5 GiB |
-| Linux Desktop — Lightweight (IceWM) | `minimal-linux-desktop:icewm` | 1 GiB |
-| Linux Desktop — Media (audio + camera) | `minimal-media-desktop:xfce` | 2 GiB |
-| Chrome Node (Selenium) | `local-seleniarm/standalone-chromium` | 2 GiB |
-| Firefox Node (Selenium) | `local-seleniarm/standalone-firefox` | 2 GiB |
+| Template | Image | Memory cap | CPU cap |
+|----------|-------|-----------|---------|
+| Linux Desktop — XFCE *(recommended)* | `minimal-linux-desktop:xfce` | 2 GiB | 2 |
+| Linux Desktop — IceWM (lightweight) | `minimal-linux-desktop:icewm` | 1.5 GiB | 2 |
+| Chrome Node (Selenium) | `local-seleniarm/standalone-chromium` | 2 GiB | 2 |
+| Firefox Node (Selenium) | `local-seleniarm/standalone-firefox` | 2 GiB | 2 |
 
-Memory caps apply **only when a machine is capped** (see "shared by default" below).
+Caps are applied **by default** (`capResources: true`). This matters because the
+VM runs with **no swap**: an uncapped desktop that balloons drives the whole VM
+into the OOM killer, which then kills the largest process rather than the
+offender. An admin can opt a single machine out with `cap: false` at create time.
 The **Resources** tab shows a ≥ 80 % warning when the VM is oversubscribed.
 
 Creating is a **two-step flow**: pick a category (Linux Desktop / Browser Node),
@@ -107,10 +112,14 @@ desktop until a browser is running** — two ways to get one:
   NEW nodes publish this port on the LAN so other PCs can run tests against
   them; existing nodes keep their original binding until recreated.
 
-### Media Desktop (speaker + microphone + camera)
+### Audio, microphone and camera on the desktops
 
-The plain VNC desktops carry only pixels + keyboard/mouse — **no audio, no
-camera**. The **Media Desktop** template fixes that: it runs
+Both Linux desktops are KasmVNC-based, so speaker and microphone work on either —
+there is no separate "Media" template (an earlier design had one; it was folded
+into the standard desktops). The camera is OFF by default: Kasm's webcam service
+crash-loops against an idle `v4l2loopback` device and burns roughly a full vCPU
+per desktop, which was the dominant cause of desktop lag. What follows describes
+that KasmVNC stack: it runs
 [KasmVNC](https://www.kasmweb.com/kasmvnc) instead of x11vnc/noVNC, streaming
 **desktop audio out**, piping the **browser microphone in**, and (on a host with
 a camera device) feeding the **browser webcam** into the desktop. It ships with
@@ -211,7 +220,11 @@ an oversight. Moving off a trusted LAN would mean fronting the panel with TLS
 ### Production hardening (built in)
 
 - **Security:** session cookie is `Secure` under `publicTls`; a strict **Content-Security-Policy** on the app shell (`script-src 'self'`, `frame-src` scoped to the machine origin); raw `docker` stderr is shown only to admins; per-user rate limit on expensive actions.
-- **Reliability:** `/api/state` serves a 5-second single-flight cache (no per-poll docker storm); a corrupt store or uncaught error is tagged `[VMP_FATAL]` **and** POSTed to `alertWebhook` so a launchd crash-loop is never invisible; shutdown awaits pending flushes; stale upload temp files are swept at boot; `newsyslog` rotation is installed for the process logs.
+- **Reliability:** `/api/state` serves a 5-second single-flight cache (no per-poll docker storm); a corrupt store or uncaught error is tagged `[VMP_FATAL]` **and** POSTed to `alertWebhook` so a launchd crash-loop is never invisible; shutdown awaits pending flushes; stale upload temp files are swept at boot; `newsyslog` rotation for the process logs is ATTEMPTED by `install.sh` (it needs
+  sudo; if unavailable it prints the command to run manually — verify with
+  `ls /etc/newsyslog.d/vm-panel.conf`). The in-process logs are self-bounding
+  regardless: the access log rotates at 5 MB x3, `audit.jsonl` trims to 5000
+  entries, and `alerts.jsonl` rotates at 1 MB.
 - **Alerts:** the metrics engine also flags **unhealthy** containers and a **stale backup** (no successful run in 48h), on top of VM-down / memory / disk.
 - **Audit:** every privileged action (sign-in success/failure, user create/update/delete, machine create/delete, sharing, VM control) is appended to `data/audit.jsonl` and shown, newest-first, in the admin **Audit** tab (`GET /api/audit`, admin-only).
 
@@ -257,6 +270,97 @@ wrapper that runs it:
 Set `VMP_NO_OPEN=1` to suppress the browser open (used by tests). The launchers
 depend on the `com.vmpanel` launchd agent being installed.
 
+## Runbook
+
+### Deploy a new version
+
+`deploy.sh` is the only supported way to get code onto a host. It gates on the
+test suite, exports an exact commit (not a copy of your working tree), records the
+commit in `BUILD_INFO.json`, keeps the previous release for rollback, never touches
+`data/`, and then verifies that the RUNNING panel reports the commit it deployed.
+
+```sh
+bash deploy.sh --target /Users/mac/vm-panel \
+  --restart "launchctl kickstart -k gui/$(id -u)/com.vmpanel"
+```
+
+On Linux (EC2): `sudo bash deploy.sh --target /opt/vm-panel --restart "systemctl restart vm-panel"`.
+
+Roll back:
+
+```sh
+rm -rf /opt/vm-panel && mv /opt/vm-panel.previous /opt/vm-panel && systemctl restart vm-panel
+```
+
+### Which build is actually running?
+
+Every deployment used to report version `1.0.0`, so a tree many commits behind
+HEAD was indistinguishable from HEAD. Now:
+
+```sh
+curl -s http://127.0.0.1:5050/healthz     # {"build":"<commit>", ...}
+grep VMP_BUILD ~/Library/Logs/vm-panel.log | tail -1
+```
+
+Compare that commit against `git log`. If they differ, the host is stale — deploy.
+
+### The panel is down / not answering
+
+1. **Is the process alive?** `curl -s http://127.0.0.1:5050/healthz` — liveness only.
+2. **Can it serve machines?** `curl -s http://127.0.0.1:5050/readyz` — this checks
+   the VM, docker reachability and snapshot freshness, and returns a `reason`
+   (`vm_not_running`, `docker_unreachable`, `snapshot_stale`).
+3. **Is it supervised?** macOS: `launchctl print gui/$(id -u)/com.vmpanel`. If it
+   says "Could not find service", the agent is not loaded and nothing will restart
+   the panel — `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vmpanel.plist`.
+   Linux: `systemctl status vm-panel`.
+4. **Is the data plane up?** `colima status` (macOS) or `systemctl status docker`.
+   A stopped VM is reported as degraded, not fixed automatically.
+5. **Refused to start?** Look for `[VMP_FATAL]`. `already using` means another
+   instance holds the data directory (two panels corrupt it, so this is refused);
+   stop the other one, or remove `data/panel.lock` if you are certain it is gone.
+6. **Do NOT trust the last log line alone.** A clean shutdown writes nothing, so
+   the final entry is often an unrelated older alert.
+
+### Rotate a compromised signing secret
+
+`data/secret` signs session cookies AND single-use SSO tokens. Rotating it logs
+everyone out — and because per-machine desktop credentials are DERIVED from it,
+existing desktops become unreachable and must be recreated.
+
+```sh
+launchctl bootout gui/$(id -u)/com.vmpanel      # or: systemctl stop vm-panel
+rm data/secret                                   # a new one is generated at boot
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.vmpanel.plist
+# then delete + recreate each desktop so its credential matches the new secret
+```
+
+Rotate the PRISM integration token separately: generate with
+`openssl rand -base64 32` (the panel rejects anything under 32 characters and
+silently disables its whole integration API), set `panelApiToken`, restart, then
+update it in PRISM under Settings → Virtual Machines.
+
+### Patch the desktop images
+
+Images are pinned by tag, and a tag that drifts from the code is a real failure
+mode: the code expects KasmVNC on port 6901, and an older noVNC-on-6080 image
+tagged `:xfce` cannot be proxied at all.
+
+```sh
+docker build -t minimal-linux-desktop:xfce \
+             -t minimal-linux-desktop:xfce-$(date +%Y%m%d) images/linux-desktop
+docker inspect minimal-linux-desktop:xfce --format '{{.Config.ExposedPorts}}'   # expect 6901
+```
+
+Keep the previous build under a dated tag so it can be rolled back to. Existing
+containers keep running their old image until recreated.
+
+### Node upgrades
+
+The launchd plist and systemd unit hardcode the node path. After `brew upgrade node`
+or an apt upgrade, restart the panel and confirm `/healthz` answers — the app
+requires Node >= 20.
+
 ## Break-glass
 
 - Forgot the admin password / locked out: stop the panel, delete
@@ -270,7 +374,8 @@ depend on the `com.vmpanel` launchd agent being installed.
 bash /Users/mac/vm-panel/install.sh
 ```
 
-This gates on the test suite, then bootstraps two launchd agents: **`com.vmpanel`**
+This RUNS the test suite (warning and continuing if it fails — it is not a gate;
+use `deploy.sh`, which does gate), then bootstraps two launchd agents: **`com.vmpanel`**
 (auto-start at login, auto-restart on crash) and **`com.vmpanel.backup`** (daily
 data backup). Re-run any time to update.
 
@@ -320,7 +425,10 @@ as a normal launchd agent (no root).
 ## CI & provisioning
 
 - `.github/workflows/ci.yml` runs the full `node --test` suite plus a shell lint on
-  every push/PR — nothing untested reaches the host.
+  every push/PR. Note this gates the REPOSITORY, not the host: CI runs on GitHub
+  runners and there is no deploy job, so green CI does not imply the deployed tree
+  is current. `deploy.sh` is what gates code reaching a host, and it stamps the
+  commit so the running build is verifiable (`/healthz` reports it).
 - `deploy/cloud-init.yaml` is an Infrastructure-as-Code starting point for a fresh
   Ubuntu/Graviton EC2 host (Docker + Node + systemd unit + backup timer). It also
   installs + loads `v4l2loopback` so Media Desktops get a working camera device.
