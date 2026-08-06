@@ -28,7 +28,7 @@ test('MetricsStore.prometheus emits gauges (empty-safe)', () => {
   assert.match(text, /vmpanel_machines_running 2/);
 });
 
-test('deriveAlerts: vm-down dominates; mem/disk warn+crit thresholds', () => {
+test('deriveAlerts: vm-down leads; mem/disk warn+crit thresholds', () => {
   assert.deepEqual(deriveAlerts(null), []);
   assert.equal(deriveAlerts({ vmRunning: false })[0].id, 'vm-down');
   const ok = deriveAlerts({ vmRunning: true, memUsed: 10, memTotal: 100, diskUsed: 10, diskTotal: 100 });
@@ -38,6 +38,23 @@ test('deriveAlerts: vm-down dominates; mem/disk warn+crit thresholds', () => {
   const crit = deriveAlerts({ vmRunning: true, memUsed: 96, memTotal: 100, diskUsed: 99, diskTotal: 100 });
   assert.ok(crit.some((a) => a.id === 'mem' && a.level === 'critical'));
   assert.ok(crit.some((a) => a.id === 'disk' && a.level === 'critical'));
+});
+
+test('deriveAlerts: a down VM does not suppress disk or stale-backup alerts', () => {
+  // These used to sit after an early `return` on vm-down, so while the VM was down
+  // — the exact moment you most want to know the disk is full or the backups have
+  // stopped — both checks were silently skipped. Disk is a HOST property, and a
+  // full disk is often *why* the VM will not start again.
+  const alerts = deriveAlerts(
+    { vmRunning: false, diskUsed: 99, diskTotal: 100 },
+    { backupAgeMs: 5 * 24 * 60 * 60 * 1000 },
+  );
+  assert.ok(alerts.some((a) => a.id === 'vm-down' && a.level === 'critical'), 'still reports the VM being down');
+  assert.ok(alerts.some((a) => a.id === 'disk' && a.level === 'critical'), 'disk alert survives a down VM');
+  assert.ok(alerts.some((a) => a.id === 'backup-stale'), 'stale-backup alert survives a down VM');
+  // Per-container figures are meaningless with the VM down, so they stay absent.
+  assert.ok(!alerts.some((a) => a.id === 'mem'), 'no memory alert without VM figures');
+  assert.ok(!alerts.some((a) => a.id === 'unhealthy'), 'no container-health alert with the VM down');
 });
 
 test('deriveAlerts: unhealthy-container warning', () => {

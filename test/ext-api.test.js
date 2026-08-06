@@ -106,7 +106,10 @@ test('ext: behind TLS, machineOrigin + SSO url use the public host, not the requ
     await setupAdmin(panel)
     const list = await panel.req('GET', '/api/ext/machines', { headers: AUTH })
     assert.equal(list.json.machineOrigin, 'https://vm.example.test:5443', 'public host, not 127.0.0.1')
-    const mint = await panel.req('POST', '/api/ext/sso/mint', { headers: AUTH, body: { username: 'admin' } })
+    // Mint for a provisioned CONTRACTOR, not the admin: the ext API refuses to
+    // issue SSO for an administrator (that would let the bearer token escalate).
+    await panel.req('POST', '/api/ext/users', { headers: AUTH, body: { username: 'contractor', role: 'user' } })
+    const mint = await panel.req('POST', '/api/ext/sso/mint', { headers: AUTH, body: { username: 'contractor' } })
     assert.match(mint.json.url, /^https:\/\/vm\.example\.test:5443\/sso\?t=/)
   } finally { panel.kill() }
 })

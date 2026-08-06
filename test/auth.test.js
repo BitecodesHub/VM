@@ -59,7 +59,7 @@ test('parseCookies parses first occurrence, ignores junk', () => {
   assert.equal(parseCookies(undefined).size, 0);
 });
 
-test('LoginLimiter: per-username lockout at 5, window expiry, success reset', () => {
+test('LoginLimiter: per (username, IP) lockout at 5 — and NOT an account-wide lockout', () => {
   let t = 1_000_000;
   const lim = new LoginLimiter({ now: () => t });
   for (let i = 0; i < 5; i++) {
@@ -67,10 +67,13 @@ test('LoginLimiter: per-username lockout at 5, window expiry, success reset', ()
     lim.recordFailure('1.1.1.1', 'alice');
   }
   const blocked = lim.check('1.1.1.1', 'alice');
-  assert.equal(blocked.allowed, false);
+  assert.equal(blocked.allowed, false, 'the guessing source is throttled');
   assert.ok(blocked.retryAfterMs > 0);
-  // different IP, same username -> still blocked (username bucket)
-  assert.equal(lim.check('2.2.2.2', 'alice').allowed, false);
+  // A DIFFERENT IP with the same username must still be allowed. Blocking here
+  // is an unauthenticated denial-of-service: any peer could lock a known account
+  // — including the only administrator — out of their own panel with five wrong
+  // guesses. The account-wide counter is a much higher backstop instead.
+  assert.equal(lim.check('2.2.2.2', 'alice').allowed, true, 'the real user can still sign in from elsewhere');
   // window expiry unblocks
   t += 15 * 60 * 1000 + 1;
   assert.equal(lim.check('1.1.1.1', 'alice').allowed, true);
@@ -78,6 +81,16 @@ test('LoginLimiter: per-username lockout at 5, window expiry, success reset', ()
   lim.recordFailure('1.1.1.1', 'alice');
   lim.recordSuccess('1.1.1.1', 'alice');
   assert.equal(lim.check('1.1.1.1', 'alice').allowed, true);
+});
+
+test('LoginLimiter: high per-username backstop still catches a DISTRIBUTED attack', () => {
+  let t = 2_000_000;
+  const lim = new LoginLimiter({ now: () => t });
+  // Each attempt from a different network, so neither the per-IP nor the
+  // per-(user, IP) bucket ever trips — only the account-wide counter can.
+  for (let i = 0; i < 50; i++) lim.recordFailure(`10.0.${i}.5`, 'alice');
+  assert.equal(lim.check('10.0.200.5', 'alice').allowed, false, 'distributed guessing is still stopped');
+  assert.equal(lim.check('10.0.200.5', 'bob').allowed, true, 'other accounts unaffected');
 });
 
 test('LoginLimiter: per-IP lockout at 10 across usernames', () => {
@@ -91,8 +104,39 @@ test('LoginLimiter: per-IP lockout at 10 across usernames', () => {
 test('LoginLimiter: username matching is case-insensitive', () => {
   let t = 0;
   const lim = new LoginLimiter({ now: () => t });
-  for (let i = 0; i < 5; i++) lim.recordFailure(`ip${i}`, 'Alice');
-  assert.equal(lim.check('new-ip', 'alice').allowed, false);
+  // Same source throughout, so this exercises the (username, IP) bucket and does
+  // not depend on the account-wide threshold.
+  for (let i = 0; i < 5; i++) lim.recordFailure('1.1.1.1', 'Alice');
+  assert.equal(lim.check('1.1.1.1', 'alice').allowed, false, 'ALICE and alice are one account');
+});
+
+test('LoginLimiter: IPv6 is keyed by /64 prefix, so extra addresses do not reset the throttle', () => {
+  let t = 0;
+  const lim = new LoginLimiter({ now: () => t });
+  // A residential IPv6 allocation is a whole /64 — 2^64 addresses. Per-address
+  // keying let one attacker mint an unlimited number of fresh buckets.
+  for (let i = 0; i < 5; i++) lim.recordFailure(`2001:db8:abcd:1234::${i + 1}`, 'alice');
+  assert.equal(lim.check('2001:db8:abcd:1234::dead', 'alice').allowed, false, 'same /64 is one identity');
+  assert.equal(lim.check('2001:db8:abcd:9999::1', 'alice').allowed, true, 'a different /64 is a different identity');
+  // Abbreviated and IPv4-mapped forms must normalise to the same key.
+  assert.equal(LoginLimiter.ipKey('::ffff:9.9.9.9'), '9.9.9.9');
+  assert.equal(LoginLimiter.ipKey('2001:db8:abcd:1234::1'), LoginLimiter.ipKey('2001:0db8:abcd:1234:0:0:0:2'));
+});
+
+test('LoginLimiter: bucket eviction is least-recently-used, not insertion order', () => {
+  let t = 1000;
+  // Small map so we can force eviction deterministically.
+  const lim = new LoginLimiter({ now: () => t, maxBuckets: 8 });
+  // Victim fails once, early.
+  lim.recordFailure('1.1.1.1', 'victim');
+  for (let i = 0; i < 4; i++) { t += 1; lim.recordFailure('1.1.1.1', 'victim'); }
+  assert.equal(lim.check('1.1.1.1', 'victim').allowed, false, 'victim source throttled');
+  // Attacker churns many distinct keys to try to push the victim's bucket out.
+  // With FIFO eviction the oldest-INSERTED bucket (the victim's) was dropped,
+  // resetting their own throttle. LRU keeps recently-active buckets alive.
+  for (let i = 0; i < 40; i++) { t += 1; lim.recordFailure(`5.5.5.${i}`, `filler${i}`); }
+  t += 1;
+  assert.equal(lim.check('1.1.1.1', 'victim').allowed, false, 'throttle survives bucket churn');
 });
 
 test('RateLimiter: allows up to limit, blocks the next, keys are independent, window slides', () => {
