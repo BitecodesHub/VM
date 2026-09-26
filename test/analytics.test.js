@@ -91,3 +91,37 @@ test('live sessions drive active-now and floor peak concurrency', () => {
   assert.equal(d.totals.peakConcurrency, 3);
   assert.equal(d.active.length, 3);
 });
+
+test('a session spanning midnight is split across days, never >24h on one day', () => {
+  // Real production row: desktop-a left connected 2026-09-16 04:03 → 2026-09-17 14:21 (34.3h).
+  const closed = [row('ismail', 'desktop-a', '2026-09-16T04:03:43.116Z', '2026-09-17T14:21:39.810Z')];
+  const now = Date.parse('2026-09-26T18:20:00.000Z');
+  const d = summariseSessions(closed, [], { now, days: 30 });
+  const byDate = Object.fromEntries(d.daily.map((x) => [x.date, x.seconds]));
+  assert.equal(byDate['2026-09-16'], 71777);            // 04:03:43.116 → 24:00
+  assert.equal(byDate['2026-09-17'], 51700);            // 00:00 → 14:21:39.810
+  assert.ok(d.daily.every((x) => x.seconds <= 86_400), 'no day may exceed 24h');
+  assert.equal(d.totals.seconds, 123477);                // totals unchanged
+  assert.equal(byDate['2026-09-16'] + byDate['2026-09-17'], d.totals.seconds);
+});
+
+test('a session that began before the window only counts its in-window part', () => {
+  const now = Date.parse('2026-07-23T12:00:00.000Z');
+  // days=1 → window starts 2026-07-23T00:00Z; session ran 22:00 the day before → 02:00.
+  const closed = [row('alice', 'm1', '2026-07-22T22:00:00Z', '2026-07-23T02:00:00Z')];
+  const d = summariseSessions(closed, [], { now, days: 1 });
+  assert.equal(d.totals.sessions, 1);
+  assert.equal(d.totals.seconds, 7200);                 // only 00:00–02:00
+  assert.equal(d.byUser[0].seconds, 7200);
+  assert.equal(d.daily.length, 1);
+  assert.equal(d.daily[0].seconds, 7200);
+});
+
+test('a multi-day session is spread evenly across full days', () => {
+  const now = Date.parse('2026-07-23T12:00:00.000Z');
+  const closed = [row('bob', 'm2', '2026-07-19T12:00:00Z', '2026-07-22T12:00:00Z')]; // 72h
+  const d = summariseSessions(closed, [], { now, days: 7 });
+  const byDate = Object.fromEntries(d.daily.map((x) => [x.date, x.hours]));
+  assert.deepEqual([byDate['2026-07-19'], byDate['2026-07-20'], byDate['2026-07-21'], byDate['2026-07-22']], [12, 24, 24, 12]);
+  assert.equal(d.totals.hours, 72);
+});
