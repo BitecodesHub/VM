@@ -163,6 +163,31 @@ test('acquireInstanceLock: live holder blocks, dead holder is reclaimed', () => 
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('acquireInstanceLock: a lock from a previous boot is stale even if its pid is alive', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vmp-lock3-'));
+  try {
+    // process.pid is alive, so without the boot check this would block.
+    fs.writeFileSync(path.join(dir, 'panel.lock'), JSON.stringify({ pid: process.pid, bootId: 'boot-A' }));
+    const lock = acquireInstanceLock(dir, { pid: process.pid + 7, bootId: 'boot-B', isPanel: () => true });
+    assert.equal(JSON.parse(fs.readFileSync(lock.path, 'utf8')).bootId, 'boot-B', 'lock rewritten for this boot');
+    lock.release();
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('acquireInstanceLock: a live pid that is not a panel does not block (reused pid)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vmp-lock4-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'panel.lock'), JSON.stringify({ pid: process.pid, bootId: 'boot-A' }));
+    const lock = acquireInstanceLock(dir, { pid: process.pid + 7, bootId: 'boot-A', isPanel: () => false });
+    lock.release();
+    // Same boot, live pid, and it IS a panel: still refused.
+    fs.writeFileSync(path.join(dir, 'panel.lock'), JSON.stringify({ pid: process.pid, bootId: 'boot-A' }));
+    assert.throws(() => acquireInstanceLock(dir, { pid: process.pid + 7, bootId: 'boot-A', isPanel: () => true }), /already using/);
+    // Where the OS cannot say (null), a live pid still blocks, as before.
+    assert.throws(() => acquireInstanceLock(dir, { pid: process.pid + 7, bootId: 'boot-A', isPanel: () => null }), /already using/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
 // ---------------------------------------------------------------------------
 // Atomic writes
 // ---------------------------------------------------------------------------
