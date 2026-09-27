@@ -150,8 +150,9 @@ test('acquireInstanceLock: live holder blocks, dead holder is reclaimed', () => 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vmp-lock2-'));
   try {
     const held = acquireInstanceLock(dir);
-    // Our own pid is alive, so a second acquire under a different pid must fail.
-    assert.throws(() => acquireInstanceLock(dir, { pid: process.pid + 1 }), /already using/);
+    // Our own pid is alive and stands in for a running panel (on Linux the lock
+    // also checks /proc/<pid>/cmdline, and the test runner is not server.js).
+    assert.throws(() => acquireInstanceLock(dir, { pid: process.pid + 1, isPanel: () => true }), /already using/);
     held.release();
     // Released — now free.
     const again = acquireInstanceLock(dir);
