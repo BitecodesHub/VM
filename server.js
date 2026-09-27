@@ -6,7 +6,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { execFile } from 'node:child_process';
+import zlib from 'node:zlib';
+import { execFile, spawn } from 'node:child_process';
 import {
   PANEL_PORT, LOOPBACK, PROTECTED_NAMES, TEMPLATES,
   validateName, validateUsername, firstFreePort, nextName, usedHostPorts,
@@ -15,8 +16,9 @@ import {
   machineAccess, canUse, canDelete, canManageAccess, quotaExceeded, QUOTA_STATES,
   backendAuthFor, networkNameFor,
 } from './lib/core.js';
-import { loadConfig } from './lib/config.js';
-import { ensureDataDir, ensureSecret, acquireInstanceLock } from './lib/store.js';
+import { loadConfig, validateExtSettingsPatch, persistConfigPatch } from './lib/config.js';
+import { ensureDataDir, ensureSecret, acquireInstanceLock, atomicWriteJson } from './lib/store.js';
+import { ArchiveStore, validArchiveId, ARCHIVE_RETENTION_DAYS } from './lib/archives.js';
 import { UserStore } from './lib/users.js';
 import { SessionStore } from './lib/sessions.js';
 import { ShareStore } from './lib/shares.js';
@@ -150,6 +152,12 @@ try { usageSessions.load(); } catch (e) { console.error(`[VMP_USAGE] ignoring co
   const orphaned = usageSessions.reconcile('panel_restart');
   if (orphaned) console.error(`[VMP_USAGE] closed ${orphaned} orphaned session(s) left open by the previous process`);
 }
+// Restorable copies of desktops deleted through the ext API (lib/archives.js).
+// A corrupt index must not block boot: every desktop still works without it,
+// and the archived-delete path refuses (503) rather than lose a copy's record.
+let archives = null;
+try { archives = new ArchiveStore(process.env.VMP_ARCHIVE_DIR || path.join(DATA_DIR, 'archives')).load(); }
+catch (e) { console.error(`[VMP_ARCHIVE] archive index unavailable, archived delete disabled — ${e?.message || e}`); }
 // Single-use tracker for SSO login tokens (replay protection within their TTL).
 const ssoGuard = new OneTimeGuard();
 // Real client IP behind the Caddy loopback front. Caddy appends the true client
@@ -887,6 +895,286 @@ async function deleteMachine(user, name, confirm) {
   } finally {
     inFlight.delete(name);
   }
+}
+
+// ---- Archived delete + restore (ext API) ------------------------------------
+// A desktop's files live in the container's writable layer, so a plain delete
+// destroys them. The ext delete stops the desktop, streams its home directory
+// into archives/<id>.tar.gz, and only then removes the container; restore
+// creates a fresh container and copies the home directory back. Both can take
+// minutes for a large profile, which outlasts a reverse proxy's request
+// timeout, so they run as jobs that PRISM polls (GET /api/ext/jobs/<id>).
+const EXT_ACTOR = { username: 'prism', role: 'admin' };
+const ARCHIVE_TIMEOUT_MS = 15 * 60_000;
+const ARCHIVE_HEADROOM_BYTES = 1024 ** 3; // leave 1 GiB free after writing a copy
+const JOB_KEEP_MS = 60 * 60_000;
+const extJobs = new Map();            // job id -> job
+const restoringArchives = new Set();  // archive ids with a restore in progress
+
+class JobError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+
+function publicJob(j) {
+  return { id: j.id, kind: j.kind, target: j.target, status: j.status, error: j.error, result: j.result, startedAt: j.startedAt, finishedAt: j.finishedAt };
+}
+
+function startExtJob(kind, target, fn) {
+  const now = Date.now();
+  for (const [id, j] of extJobs) if (j.finishedAt && now - Date.parse(j.finishedAt) > JOB_KEEP_MS) extJobs.delete(id);
+  const job = { id: crypto.randomBytes(8).toString('hex'), kind, target, status: 'running', error: null, result: null, startedAt: new Date(now).toISOString(), finishedAt: null };
+  extJobs.set(job.id, job);
+  Promise.resolve().then(fn).then(
+    (result) => { job.status = 'done'; job.result = result ?? null; },
+    (e) => {
+      job.status = 'failed';
+      job.error = { code: e?.code || 'JOB_FAILED', message: String(e?.message || e).slice(0, 300) };
+      console.error(`[VMP_JOB] ${kind} ${target} failed: ${e?.stack || e}`);
+    },
+  ).finally(() => { job.finishedAt = new Date().toISOString(); });
+  return job;
+}
+
+// The template's home directory (/home/kasm-user, /home/seluser), derived from
+// its upload dir so the two can never disagree.
+function homeDirFor(template) {
+  const m = String(TEMPLATES[template]?.uploadDir || '').match(/^\/home\/[^/]+/);
+  return m ? m[0] : null;
+}
+
+function statfsBytes(dir) {
+  try {
+    const s = fs.statfsSync(dir);
+    return { total: Number(s.blocks) * Number(s.bsize), free: Number(s.bavail) * Number(s.bsize) };
+  } catch { return null; }
+}
+
+// `docker cp <src> -` writes a tar of <src> to stdout; gzip it straight to disk
+// (a home directory can be gigabytes, so nothing is buffered in memory).
+function dockerCpToFile(src, file) {
+  return new Promise((resolve) => {
+    const child = spawn(DOCKER, ['cp', src, '-'], { stdio: ['ignore', 'pipe', 'pipe'] });
+    const gz = zlib.createGzip({ level: 1 });
+    const out = fs.createWriteStream(file, { mode: 0o600 });
+    let stderr = '', settled = false, exitCode = null, flushed = false;
+    const finish = (ok, reason = null) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      if (!ok) { child.kill('SIGKILL'); out.destroy(); }
+      resolve({ ok, reason, stderr: stderr.slice(-500) });
+    };
+    const timer = setTimeout(() => finish(false, 'timed out'), ARCHIVE_TIMEOUT_MS);
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (e) => finish(false, e.message));
+    child.on('close', (code) => { exitCode = code; if (code !== 0) finish(false, `docker cp exited ${code}`); else if (flushed) finish(true); });
+    gz.on('error', (e) => finish(false, e.message));
+    out.on('error', (e) => finish(false, e.message));
+    out.on('finish', () => { flushed = true; if (exitCode === 0) finish(true); });
+    child.stdout.pipe(gz).pipe(out);
+  });
+}
+
+// Reverse: gunzip `file` into `docker cp -a - <dest>`. -a keeps the archived
+// uid/gid so the desktop user still owns its files after the restore.
+function dockerCpFromFile(file, dest) {
+  return new Promise((resolve) => {
+    const child = spawn(DOCKER, ['cp', '-a', '-', dest], { stdio: ['pipe', 'ignore', 'pipe'] });
+    let stderr = '', settled = false;
+    const finish = (ok, reason = null) => {
+      if (settled) return;
+      settled = true; clearTimeout(timer);
+      if (!ok) child.kill('SIGKILL');
+      resolve({ ok, reason, stderr: stderr.slice(-500) });
+    };
+    const timer = setTimeout(() => finish(false, 'timed out'), ARCHIVE_TIMEOUT_MS);
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', (e) => finish(false, e.message));
+    child.on('close', (code) => finish(code === 0, code === 0 ? null : `docker cp exited ${code}`));
+    child.stdin.on('error', () => { /* the child died; 'close' reports why */ });
+    const rs = fs.createReadStream(file);
+    const gunzip = zlib.createGunzip();
+    rs.on('error', (e) => finish(false, e.message));
+    gunzip.on('error', (e) => finish(false, e.message));
+    rs.pipe(gunzip).pipe(child.stdin);
+  });
+}
+
+async function archiveAndDeleteMachine(name, confirm, deletedBy) {
+  if (!archives) return { status: 503, body: { error: { code: 'ARCHIVES_UNAVAILABLE', message: 'The archive store is unavailable, so a restorable copy cannot be kept.' } } };
+  if (PROTECTED_NAMES.has(name)) return { status: 403, body: { error: { code: 'PROTECTED', message: 'this machine is protected' } } };
+  if (confirm !== name) return { status: 400, body: { error: { code: 'VALIDATION', message: 'confirmation mismatch' } } };
+  const resolved = await resolveMachine(EXT_ACTOR, name, 'delete');
+  if (resolved.error) return resolved.error;
+  const { card } = resolved;
+  const homeDir = homeDirFor(card.template);
+  if (!homeDir) return { status: 400, body: { error: { code: 'ARCHIVE_UNSUPPORTED', message: 'This machine type has no home directory to keep.' } } };
+  if (inFlight.has(name)) return { status: 409, body: { error: { code: 'JOB_IN_FLIGHT', message: 'another action is in progress' } } };
+
+  // The uncompressed writable layer bounds the copy from above. Refuse up front
+  // rather than fill the disk every other desktop writes to.
+  const disk = await diskCache.get();
+  const rwBytes = disk.value?.sizes?.get(name)?.sizeRwBytes ?? 2 * 1024 ** 3;
+  const fsInfo = statfsBytes(archives.dir);
+  const need = rwBytes + ARCHIVE_HEADROOM_BYTES;
+  if (fsInfo && fsInfo.free < need) {
+    const gb = (b) => (b / 1024 ** 3).toFixed(1);
+    return { status: 507, body: { error: { code: 'INSUFFICIENT_STORAGE', message: `Not enough free disk to keep a copy (needs about ${gb(need)} GB, ${gb(fsInfo.free)} GB free). Free some space, or delete without a copy.` } } };
+  }
+
+  inFlight.add(name);
+  const job = startExtJob('delete', name, async () => {
+    const id = archives.newId();
+    const partial = archives.partialFor(id);
+    const wasActive = QUOTA_STATES.has(card.state);
+    let removed = false;
+    try {
+      if (card.state === 'paused') await run(DOCKER, ['unpause', name], TIMEOUTS.mutate);
+      // Stop first so open apps flush their files and the copy is consistent.
+      await run(DOCKER, ['stop', '-t', '10', name], TIMEOUTS.mutate);
+      dropBrowserSession(name);
+      invalidateMachineCache();
+      const cp = await dockerCpToFile(`${name}:${homeDir}`, partial);
+      let bytes = 0;
+      try { bytes = fs.statSync(partial).size; } catch { /* missing */ }
+      if (!cp.ok || bytes === 0) {
+        throw new JobError('ARCHIVE_FAILED', `The desktop's files could not be copied (${cp.reason || 'empty copy'}). Nothing was deleted.`);
+      }
+      fs.renameSync(partial, archives.fileFor(id));
+      const entry = await archives.add({
+        id, machine: name, displayName: machineMeta.displayName(name), template: card.template,
+        owner: card.owner, sharedWith: shares.listFor(name), homeDir, bytes, deletedBy,
+      });
+      if (!(await rmContainer(name))) {
+        await archives.remove(id).catch(() => {});
+        throw new JobError('DOCKER_CLI_ERROR', 'The copy was made but the desktop could not be removed, so it has been left in place.');
+      }
+      removed = true;
+      invalidateMachineCache();
+      await shares.removeMachine(name);
+      await machineMeta.removeMachine(name);
+      audit.record({ actor: 'prism', action: 'machine.delete', target: name, detail: { via: 'ext', archive: id, bytes, deletedBy }, ip: null });
+      return { name, archive: entry };
+    } catch (e) {
+      try { fs.unlinkSync(partial); } catch { /* never written */ }
+      // Nothing was removed: put the desktop back the way it was found.
+      if (!removed && wasActive) await run(DOCKER, ['start', name], TIMEOUTS.mutate).catch(() => {});
+      invalidateMachineCache();
+      throw e;
+    } finally {
+      inFlight.delete(name);
+    }
+  });
+  return { status: 202, body: { ok: true, job: publicJob(job) } };
+}
+
+async function restoreArchive(id, { name: wantName, owner: wantOwner } = {}) {
+  if (!archives) return { status: 503, body: { error: { code: 'ARCHIVES_UNAVAILABLE', message: 'The archive store is unavailable.' } } };
+  if (!validArchiveId(id)) return { status: 400, body: { error: { code: 'VALIDATION', message: 'invalid archive id' } } };
+  const entry = archives.get(id);
+  if (!entry || archives.isExpired(id)) return { status: 404, body: { error: { code: 'ARCHIVE_NOT_FOUND', message: 'That copy no longer exists (it may have expired).' } } };
+  if (restoringArchives.has(id)) return { status: 409, body: { error: { code: 'JOB_IN_FLIGHT', message: 'This copy is already being restored.' } } };
+
+  const owner = String(wantOwner || entry.owner || '').toLowerCase();
+  const ownerUser = validateUsername(owner) ? users.get(owner) : null;
+  if (!ownerUser || ownerUser.disabled) {
+    return { status: 409, body: { error: { code: 'OWNER_UNAVAILABLE', message: `The owner “${owner || 'unknown'}” no longer has an active desktop account. Choose a new owner.` } } };
+  }
+  const name = wantName != null && String(wantName).trim() !== '' ? String(wantName).trim() : entry.machine;
+  if (!validateName(name) || PROTECTED_NAMES.has(name)) return { status: 400, body: { error: { code: 'VALIDATION', message: 'invalid name (letters, digits, _ . - only)' } } };
+  let inspects;
+  try { inspects = await inspectAll(); }
+  catch (e) {
+    if (e instanceof DockerDownError) return { status: 503, body: { error: { code: 'DOCKER_UNAVAILABLE', message: 'Docker daemon unreachable' } } };
+    throw e;
+  }
+  if (inspects.some((i) => String(i.Name).replace(/^\//, '') === name)) {
+    return { status: 409, body: { error: { code: 'NAME_TAKEN', message: `A machine named “${name}” already exists. Choose another name.` } } };
+  }
+
+  restoringArchives.add(id);
+  const job = startExtJob('restore', name, async () => {
+    try {
+      const viewers = entry.sharedWith.filter((v) => v !== owner && users.get(v));
+      const out = await createMachine({ username: owner, role: 'admin' }, entry.template, { name, viewers });
+      if (out.status >= 300) throw new JobError(out.body?.error?.code || 'CREATE_FAILED', out.body?.error?.message || 'The desktop could not be created.');
+      inFlight.add(name);
+      try {
+        await run(DOCKER, ['stop', '-t', '10', name], TIMEOUTS.mutate);
+        const cp = await dockerCpFromFile(archives.fileFor(id), `${name}:${path.posix.dirname(entry.homeDir)}`);
+        if (!cp.ok) {
+          // Leave no half-restored desktop behind; the copy is kept for a retry.
+          await rmContainer(name).catch(() => {});
+          await shares.removeMachine(name).catch(() => {});
+          invalidateMachineCache();
+          throw new JobError('RESTORE_FAILED', `The files could not be copied back (${cp.reason}). The copy is kept, so you can try again.`);
+        }
+        const started = await run(DOCKER, ['start', name], TIMEOUTS.mutate);
+        // Browser profiles still hold the old container's lock files, which make
+        // Chromium/Firefox refuse to open ("profile in use on another computer").
+        await run(DOCKER, ['exec', name, 'sh', '-c',
+          'rm -f /home/*/.config/chromium/Singleton* /home/*/.config/google-chrome/Singleton* /home/*/.mozilla/firefox/*/lock /home/*/.mozilla/firefox/*/.parentlock 2>/dev/null; true'],
+        TIMEOUTS.read).catch(() => {});
+        if (entry.displayName) await machineMeta.setDisplayName(name, entry.displayName).catch(() => {});
+        await archives.remove(id);
+        invalidateMachineCache();
+        audit.record({ actor: 'prism', action: 'machine.restore', target: name, detail: { via: 'ext', archive: id, owner }, ip: null });
+        return { name, owner, started: started.ok };
+      } finally {
+        inFlight.delete(name);
+      }
+    } finally {
+      restoringArchives.delete(id);
+    }
+  });
+  return { status: 202, body: { ok: true, job: publicJob(job) } };
+}
+
+// Hourly: drop copies past their retention, and files no index entry claims.
+function sweepArchives() {
+  if (!archives) return;
+  archives.purgeExpired()
+    .then((ids) => { if (ids.length) console.error(`[VMP_ARCHIVE] purged ${ids.length} expired cop${ids.length === 1 ? 'y' : 'ies'}`); })
+    .catch((e) => console.error(`[VMP_ARCHIVE] purge failed — ${e?.message || e}`));
+  const orphans = archives.sweepOrphans();
+  if (orphans.length) console.error(`[VMP_ARCHIVE] removed ${orphans.length} orphaned file(s)`);
+}
+sweepArchives();
+setInterval(sweepArchives, 60 * 60_000).unref?.();
+
+// Host-level capacity, independent of the Colima probe: on the EC2 host the
+// panel runs beside Docker, so these are the numbers the OOM killer acts on.
+function hostSnapshot() {
+  let memAvailableBytes = null;
+  try {
+    const m = fs.readFileSync('/proc/meminfo', 'utf8').match(/^MemAvailable:\s+(\d+)\s+kB/m);
+    if (m) memAvailableBytes = Number(m[1]) * 1024;
+  } catch { /* not Linux */ }
+  const disk = statfsBytes(DATA_DIR);
+  return {
+    cpus: os.cpus().length,
+    loadAvg: os.loadavg().map((n) => Math.round(n * 100) / 100),
+    memTotalBytes: os.totalmem(),
+    memAvailableBytes: memAvailableBytes ?? os.freemem(),
+    diskTotalBytes: disk?.total ?? null,
+    diskFreeBytes: disk?.free ?? null,
+    uptimeSec: Math.round(os.uptime()),
+  };
+}
+
+function extSettingsBody() {
+  return {
+    settings: {
+      maxRunningMachines: config.maxRunningMachines,
+      idleStopMinutes: config.idleStopMinutes,
+      capResources: !!config.capResources,
+    },
+    readOnly: {
+      sessionIdleHours: config.sessionIdleHours,
+      sessionMaxDays: config.sessionMaxDays,
+      perUserRunningLimit: USER_RUNNING_LIMIT,
+      archiveRetentionDays: ARCHIVE_RETENTION_DAYS,
+    },
+  };
 }
 
 // ---- Logs / readiness ------------------------------------------------------
@@ -1905,7 +2193,7 @@ async function handleExtApi(req, res, rawPath, method) {
     const body = await readJson(req);
     if (!body) return sendJson(res, 400, EXT_BAD_JSON);
     const action = String(body.action || '');
-    if (!['start', 'stop', 'restart'].includes(action)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'action must be start, stop or restart' } });
+    if (!['start', 'stop', 'restart', 'unpause'].includes(action)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'action must be start, stop, restart or unpause' } });
     const out = await lifecycle({ username: 'prism', role: 'admin' }, name, action);
     if (out.status < 300) { invalidateMachineCache(); recordAudit(req, 'prism', `machine.${action}`, name, { via: 'ext' }); }
     return sendJson(res, out.status, out.body);
@@ -1969,6 +2257,155 @@ async function handleExtApi(req, res, rawPath, method) {
     const link = `/sso?t=${encodeURIComponent(token)}`;
     recordAudit(req, 'prism', 'sso.mint', username, { machine, via: 'ext' });
     return sendJson(res, 200, { ok: true, token, path: link, url: machineOriginFor(req) + link, expiresAt: new Date(now + ttlSec * 1000).toISOString() });
+  }
+
+  // ---- Full machine management (PRISM /settings/vms) -----------------------
+  // Everything the panel's own admin screen can do, so an administrator never
+  // has to leave PRISM. All calls act as an admin; PRISM gates them on manage_vms.
+  const url = new URL(req.url, `http://${LOOPBACK}`);
+
+  if (sub === '/templates' && method === 'GET') return sendJson(res, 200, { templates: listTemplates() });
+
+  // Delete. Body { confirm: <name>, archive?: boolean (default true), actor? }.
+  // With archive (the default) this returns 202 + a job; poll /jobs/<id>.
+  if ((m = sub.match(/^\/machines\/([^/]+)$/)) && method === 'DELETE') {
+    const name = decodeURIComponent(m[1]);
+    const body = (await readJson(req)) || {};
+    if (body.archive === false) {
+      const out = await deleteMachine(EXT_ACTOR, name, body.confirm);
+      if (out.status === 200) { invalidateMachineCache(); recordAudit(req, 'prism', 'machine.delete', name, { via: 'ext', archive: null }); }
+      return sendJson(res, out.status, out.body);
+    }
+    const actor = typeof body.actor === 'string' ? body.actor.slice(0, 128) : null;
+    const out = await archiveAndDeleteMachine(name, body.confirm, actor);
+    if (out.status === 202) recordAudit(req, 'prism', 'machine.delete.requested', name, { via: 'ext', job: out.body.job.id });
+    return sendJson(res, out.status, out.body);
+  }
+
+  if ((m = sub.match(/^\/jobs\/([a-f0-9]{16})$/)) && method === 'GET') {
+    const job = extJobs.get(m[1]);
+    if (!job) return sendJson(res, 404, { error: { code: 'JOB_NOT_FOUND', message: 'no such job (it may have finished over an hour ago, or the panel restarted)' } });
+    return sendJson(res, 200, { job: publicJob(job) });
+  }
+
+  if (sub === '/archives' && method === 'GET') {
+    if (!archives) return sendJson(res, 503, { error: { code: 'ARCHIVES_UNAVAILABLE', message: 'The archive store is unavailable.' } });
+    return sendJson(res, 200, { archives: archives.list(), retentionDays: ARCHIVE_RETENTION_DAYS, totalBytes: archives.totalBytes() });
+  }
+  if ((m = sub.match(/^\/archives\/([^/]+)\/restore$/)) && method === 'POST') {
+    const body = (await readJson(req)) || {};
+    const id = decodeURIComponent(m[1]);
+    const out = await restoreArchive(id, { name: body.name, owner: body.owner });
+    if (out.status === 202) recordAudit(req, 'prism', 'machine.restore.requested', id, { via: 'ext', job: out.body.job.id });
+    return sendJson(res, out.status, out.body);
+  }
+  if ((m = sub.match(/^\/archives\/([^/]+)$/)) && method === 'DELETE') {
+    const id = decodeURIComponent(m[1]);
+    if (!archives) return sendJson(res, 503, { error: { code: 'ARCHIVES_UNAVAILABLE', message: 'The archive store is unavailable.' } });
+    if (!validArchiveId(id)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid archive id' } });
+    if (restoringArchives.has(id)) return sendJson(res, 409, { error: { code: 'JOB_IN_FLIGHT', message: 'This copy is being restored.' } });
+    if (!(await archives.remove(id))) return sendJson(res, 404, { error: { code: 'ARCHIVE_NOT_FOUND', message: 'no such copy' } });
+    recordAudit(req, 'prism', 'archive.purge', id, { via: 'ext' });
+    return sendJson(res, 200, { ok: true });
+  }
+
+  // Rename sets the display name only; the container name and screen URL stay.
+  if ((m = sub.match(/^\/machines\/([^/]+)\/rename$/)) && method === 'PATCH') {
+    const name = decodeURIComponent(m[1]);
+    const body = await readJson(req);
+    if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+    const out = await renameMachine(EXT_ACTOR, name, body.displayName ?? '');
+    if (out.status === 200) recordAudit(req, 'prism', 'machine.rename', name, { displayName: out.body.displayName, via: 'ext' });
+    return sendJson(res, out.status, out.body);
+  }
+
+  // Logs, JSON-wrapped so the client never has to sniff a content type.
+  if ((m = sub.match(/^\/machines\/([^/]+)\/logs$/)) && method === 'GET') {
+    const name = decodeURIComponent(m[1]);
+    const out = await getLogs(EXT_ACTOR, name, parseInt(url.searchParams.get('tail') || '500', 10));
+    if (out.status !== 200) return sendJson(res, out.status, { error: { code: out.status === 404 ? 'NOT_FOUND' : 'VM_ERROR', message: out.text } });
+    return sendJson(res, 200, { name, text: out.text });
+  }
+  if ((m = sub.match(/^\/machines\/([^/]+)\/ready$/)) && method === 'GET') {
+    const out = await readiness(EXT_ACTOR, decodeURIComponent(m[1]));
+    return sendJson(res, out.status, out.body);
+  }
+  if ((m = sub.match(/^\/machines\/([^/]+)\/stats$/)) && method === 'GET') {
+    const out = await getMachineStats(EXT_ACTOR, decodeURIComponent(m[1]));
+    return sendJson(res, out.status, out.body);
+  }
+
+  // Live browser window on a Selenium node.
+  if ((m = sub.match(/^\/machines\/([^/]+)\/browser$/))) {
+    const name = decodeURIComponent(m[1]);
+    if (method === 'POST') { const out = await openBrowserSession(EXT_ACTOR, name); return sendJson(res, out.status, out.body); }
+    if (method === 'DELETE') { const out = await closeBrowserSession(EXT_ACTOR, name); return sendJson(res, out.status, out.body); }
+  }
+
+  // File transfer (the machine's upload directory). Upload is a raw body.
+  if ((m = sub.match(/^\/machines\/([^/]+)\/files$/)) && method === 'GET') {
+    const out = await listMachineFiles(EXT_ACTOR, decodeURIComponent(m[1]));
+    return sendJson(res, out.status, out.body);
+  }
+  if ((m = sub.match(/^\/machines\/([^/]+)\/files\/(.+)$/))) {
+    const name = decodeURIComponent(m[1]);
+    const fn = decodeURIComponent(m[2]);
+    if (method === 'GET') return await downloadMachineFile(EXT_ACTOR, name, fn, res);
+    if (method === 'POST') {
+      res.on('finish', () => { if (res.statusCode === 200) recordAudit(req, 'prism', 'file.upload', name, { file: fn, via: 'ext' }); });
+      return uploadMachineFile(EXT_ACTOR, name, fn, req, res);
+    }
+    if (method === 'DELETE') {
+      const out = await deleteMachineFile(EXT_ACTOR, name, fn);
+      if (out.status === 200) recordAudit(req, 'prism', 'file.delete', name, { file: fn, via: 'ext' });
+      return sendJson(res, out.status, out.body);
+    }
+  }
+
+  // Capacity: per-machine usage, host headroom, the running limit, and alerts.
+  if (sub === '/resources' && method === 'GET') {
+    const r = await getResources(EXT_ACTOR);
+    const { ok, byName } = await cardsCached();
+    return sendJson(res, 200, {
+      ...r,
+      host: hostSnapshot(),
+      limits: {
+        maxRunningMachines: config.maxRunningMachines,
+        running: ok ? runningPlusPending([...byName.values()]) : null,
+        idleStopMinutes: config.idleStopMinutes,
+        capResources: !!config.capResources,
+        perUserRunningLimit: USER_RUNNING_LIMIT,
+      },
+      alerts: currentAlerts(),
+      archives: archives ? { count: archives.list().length, bytes: archives.totalBytes() } : null,
+    });
+  }
+  if (sub === '/metrics' && method === 'GET') {
+    const n = Math.min(2880, Math.max(1, parseInt(url.searchParams.get('points') || '120', 10) || 120));
+    return sendJson(res, 200, { series: metrics.series(n), latest: metrics.latest() });
+  }
+  if (sub === '/usage' && method === 'GET') return sendJson(res, 200, { owners: usage.summary() });
+  if (sub === '/audit' && method === 'GET') {
+    const limit = Math.min(1000, Math.max(1, parseInt(url.searchParams.get('limit') || '200', 10) || 200));
+    return sendJson(res, 200, { entries: audit.list({ limit }) });
+  }
+
+  // Capacity settings (lib/config.js EXT_EDITABLE). Written through to
+  // config.json, preserving every other key, and applied without a restart.
+  if (sub === '/settings') {
+    if (method === 'GET') return sendJson(res, 200, extSettingsBody());
+    if (method === 'PATCH') {
+      const body = await readJson(req);
+      if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+      const v = validateExtSettingsPatch(body);
+      if (!v.ok) return sendJson(res, 400, { error: { code: 'VALIDATION', message: v.error } });
+      try { await persistConfigPatch(DATA_DIR, v.patch, { atomicWriteJson }); }
+      catch (e) { return sendJson(res, 500, { error: { code: 'CONFIG_WRITE_FAILED', message: String(e?.message || e).slice(0, 200) } }); }
+      const before = Object.fromEntries(Object.keys(v.patch).map((k) => [k, config[k]]));
+      Object.assign(config, v.patch);
+      recordAudit(req, 'prism', 'settings.update', null, { before, after: v.patch, via: 'ext' });
+      return sendJson(res, 200, extSettingsBody());
+    }
   }
 
   return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such endpoint' } });

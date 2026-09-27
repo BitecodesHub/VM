@@ -150,6 +150,34 @@ if (cmd === 'system' && argv[1] === 'df') {
 // Enough to exercise routing/authz/validation; real byte movement is covered
 // by the browser E2E, not the fake shim.
 if (cmd === 'exec') process.exit(0);
-if (cmd === 'cp') process.exit(0);
+// Archive streams (archived delete / restore):
+//   cp <name>:<dir> -      writes a fake tar of <dir> to stdout
+//   cp -a - <name>:<dest>  reads a tar from stdin and records it on the container
+// FAKE_DOCKER_CP_FAIL makes the stdout direction fail like an unreadable path.
+if (cmd === 'cp') {
+  const args = argv.slice(1).filter((a) => a !== '-a' && a !== '-L' && a !== '-q');
+  if (args[1] === '-') {
+    const [name, dir] = args[0].split(':');
+    if (!w.containers[name]) fail(`Error response from daemon: No such container: ${name}`);
+    if (process.env.FAKE_DOCKER_CP_FAIL) fail(`Error response from daemon: Could not find the file ${dir} in container ${name}`);
+    process.stdout.write(`FAKE-TAR ${name}:${dir}\n${w.containers[name].homeContent || ''}`);
+    process.exit(0);
+  }
+  if (args[0] === '-') {
+    const [name, dest] = args[1].split(':');
+    const chunks = [];
+    process.stdin.on('data', (c) => chunks.push(c));
+    process.stdin.on('end', () => {
+      const cur = load();
+      if (!cur.containers[name]) fail(`Error response from daemon: No such container: ${name}`);
+      cur.containers[name].restored = { dest, payload: Buffer.concat(chunks).toString('utf8') };
+      save(cur);
+      process.exit(0);
+    });
+  } else {
+    process.exit(0);
+  }
+}
 
-fail(`fake-docker: unsupported command: ${argv.join(' ')}`);
+// `cp -` from stdin finishes asynchronously in its 'end' handler above.
+if (cmd !== 'cp') fail(`fake-docker: unsupported command: ${argv.join(' ')}`);
