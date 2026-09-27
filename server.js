@@ -18,7 +18,7 @@ import {
 } from './lib/core.js';
 import { loadConfig, validateExtSettingsPatch, persistConfigPatch } from './lib/config.js';
 import { ensureDataDir, ensureSecret, acquireInstanceLock, atomicWriteJson } from './lib/store.js';
-import { ArchiveStore, validArchiveId, ARCHIVE_RETENTION_DAYS } from './lib/archives.js';
+import { ArchiveStore, validArchiveId, validArchiveRef, ARCHIVE_RETENTION_DAYS } from './lib/archives.js';
 import { UserStore } from './lib/users.js';
 import { SessionStore } from './lib/sessions.js';
 import { ShareStore } from './lib/shares.js';
@@ -999,7 +999,7 @@ function dockerCpFromFile(file, dest) {
   });
 }
 
-async function archiveAndDeleteMachine(name, confirm, deletedBy) {
+async function archiveAndDeleteMachine(name, confirm, deletedBy, ref = null) {
   if (!archives) return { status: 503, body: { error: { code: 'ARCHIVES_UNAVAILABLE', message: 'The archive store is unavailable, so a restorable copy cannot be kept.' } } };
   if (PROTECTED_NAMES.has(name)) return { status: 403, body: { error: { code: 'PROTECTED', message: 'this machine is protected' } } };
   if (confirm !== name) return { status: 400, body: { error: { code: 'VALIDATION', message: 'confirmation mismatch' } } };
@@ -1042,7 +1042,7 @@ async function archiveAndDeleteMachine(name, confirm, deletedBy) {
       fs.renameSync(partial, archives.fileFor(id));
       const entry = await archives.add({
         id, machine: name, displayName: machineMeta.displayName(name), template: card.template,
-        owner: card.owner, sharedWith: shares.listFor(name), homeDir, bytes, deletedBy,
+        owner: card.owner, sharedWith: shares.listFor(name), homeDir, bytes, deletedBy, ref,
       });
       if (!(await rmContainer(name))) {
         await archives.remove(id).catch(() => {});
@@ -1118,7 +1118,7 @@ async function restoreArchive(id, { name: wantName, owner: wantOwner } = {}) {
         await archives.remove(id);
         invalidateMachineCache();
         audit.record({ actor: 'prism', action: 'machine.restore', target: name, detail: { via: 'ext', archive: id, owner }, ip: null });
-        return { name, owner, started: started.ok };
+        return { name, owner, started: started.ok, archive: id, ref: entry.ref };
       } finally {
         inFlight.delete(name);
       }
@@ -2277,7 +2277,8 @@ async function handleExtApi(req, res, rawPath, method) {
       return sendJson(res, out.status, out.body);
     }
     const actor = typeof body.actor === 'string' ? body.actor.slice(0, 128) : null;
-    const out = await archiveAndDeleteMachine(name, body.confirm, actor);
+    if (body.ref !== undefined && !validArchiveRef(body.ref)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid ref' } });
+    const out = await archiveAndDeleteMachine(name, body.confirm, actor, body.ref ?? null);
     if (out.status === 202) recordAudit(req, 'prism', 'machine.delete.requested', name, { via: 'ext', job: out.body.job.id });
     return sendJson(res, out.status, out.body);
   }

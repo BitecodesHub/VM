@@ -42,7 +42,7 @@ test('ext delete: keeps a restorable copy, removes the machine, and restore brin
 
     assert.equal((await panel.req('DELETE', '/api/ext/machines/desk-arch', { headers: AUTH, body: { confirm: 'wrong' } })).status, 400, 'confirmation must match');
 
-    const del = await panel.req('DELETE', '/api/ext/machines/desk-arch', { headers: AUTH, body: { confirm: 'desk-arch', actor: 'admin@example' } });
+    const del = await panel.req('DELETE', '/api/ext/machines/desk-arch', { headers: AUTH, body: { confirm: 'desk-arch', actor: 'admin@example', ref: 'prism-ref-1' } });
     assert.equal(del.status, 202, del.text);
     const job = await waitJob(panel, del.json.job.id);
     assert.equal(job.status, 'done', JSON.stringify(job.error));
@@ -60,6 +60,7 @@ test('ext delete: keeps a restorable copy, removes the machine, and restore brin
     assert.equal(entry.displayName, 'Reception PC');
     assert.deepEqual(entry.sharedWith, ['bob']);
     assert.equal(entry.deletedBy, 'admin@example');
+    assert.equal(entry.ref, 'prism-ref-1', 'caller reference kept');
 
     // The file on disk is a real gzip of what docker cp streamed, and private.
     const file = path.join(panel.dataDir, 'archives', `${entry.id}.tar.gz`);
@@ -70,7 +71,8 @@ test('ext delete: keeps a restorable copy, removes the machine, and restore brin
     assert.equal(rest.status, 202, rest.text);
     const rjob = await waitJob(panel, rest.json.job.id);
     assert.equal(rjob.status, 'done', JSON.stringify(rjob.error));
-    assert.deepEqual({ name: rjob.result.name, owner: rjob.result.owner }, { name: 'desk-arch', owner: 'alice' });
+    assert.deepEqual({ name: rjob.result.name, owner: rjob.result.owner, ref: rjob.result.ref }, { name: 'desk-arch', owner: 'alice', ref: 'prism-ref-1' });
+    assert.equal((await panel.req('DELETE', '/api/ext/machines/desk-arch', { headers: AUTH, body: { confirm: 'desk-arch', ref: 'bad ref!' } })).status, 400, 'ref validated');
 
     const back = (await panel.req('GET', '/api/ext/machines', { headers: AUTH })).json.machines.find((m) => m.name === 'desk-arch');
     assert.ok(back, 'machine restored');
