@@ -1208,7 +1208,10 @@ async function getResources(user) {
 // ---- Access list (sharing) — admin only, enforced at route -----------------
 async function getAccess(name) {
   if (!validateName(name)) return { status: 400, body: { error: { code: 'VALIDATION', message: 'invalid name' } } };
-  const card = await resolveMachineCached(name);
+  const { ok, byName } = await cardsCached();
+  // Without a trustworthy machine list a 404 would tell PRISM the machine is gone.
+  if (!ok) return { status: 503, body: { error: { code: 'DOCKER_UNAVAILABLE', message: 'Docker daemon unreachable' } } };
+  const card = byName.get(name);
   if (!card || !isPanelMachine(card)) return { status: 404, body: { error: { code: 'NOT_FOUND', message: 'no such machine' } } };
   return { status: 200, body: { name, owner: card.owner, sharedWith: shares.listFor(name) } };
 }
@@ -1216,7 +1219,9 @@ async function putAccess(name, sharedWith) {
   if (!validateName(name)) return { status: 400, body: { error: { code: 'VALIDATION', message: 'invalid name' } } };
   if (!Array.isArray(sharedWith)) return { status: 400, body: { error: { code: 'VALIDATION', message: 'sharedWith must be an array' } } };
   if (sharedWith.length > 256) return { status: 400, body: { error: { code: 'VALIDATION', message: 'too many users' } } };
-  const card = await resolveMachineCached(name);
+  const { ok, byName } = await cardsCached();
+  if (!ok) return { status: 503, body: { error: { code: 'DOCKER_UNAVAILABLE', message: 'Docker daemon unreachable' } } };
+  const card = byName.get(name);
   if (!card || !isPanelMachine(card)) return { status: 404, body: { error: { code: 'NOT_FOUND', message: 'no such machine' } } };
   for (const u of sharedWith) {
     if (!validateUsername(u) || !users.get(u)) return { status: 400, body: { error: { code: 'VALIDATION', message: `unknown user: ${u}` } } };
@@ -1804,8 +1809,10 @@ async function handleExtApi(req, res, rawPath, method) {
 
   // List all panel machines with their sharing ACL + screen path.
   if (sub === '/machines' && method === 'GET') {
-    let cards = [];
-    try { cards = await inspectCards(); } catch { /* docker down → empty */ }
+    let cards;
+    // An empty list here reads as "no machines exist" to PRISM, so an outage must not look like one.
+    try { cards = await inspectCards(); }
+    catch { return sendJson(res, 503, { error: { code: 'DOCKER_UNAVAILABLE', message: 'Docker daemon unreachable' } }); }
     const machines = cards.filter(isPanelMachine).map((c) => ({
       name: c.name,
       displayName: machineMeta.displayName(c.name) || null,

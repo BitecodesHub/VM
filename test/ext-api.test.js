@@ -71,6 +71,44 @@ test('ext: set a machine access ACL (assign), validated against real users', asy
   });
 });
 
+test('ext: docker down → 503 on machines and access, never an empty list or 404', async () => {
+  const panel = await spawnPanel({ dockerDown: true, env: { VMP_PANEL_API_TOKEN: TOKEN } });
+  try {
+    await setupAdmin(panel);
+    const list = await panel.req('GET', '/api/ext/machines', { headers: AUTH });
+    assert.equal(list.status, 503, 'an outage must not read as "no machines"');
+    assert.equal(list.json.error.code, 'DOCKER_UNAVAILABLE');
+    assert.equal(list.json.machines, undefined);
+
+    const get = await panel.req('GET', '/api/ext/machines/shared-desk/access', { headers: AUTH });
+    assert.equal(get.status, 503, 'an outage must not read as "machine gone"');
+    assert.equal(get.json.error.code, 'DOCKER_UNAVAILABLE');
+
+    const put = await panel.req('PUT', '/api/ext/machines/shared-desk/access', { headers: AUTH, body: { sharedWith: [] } });
+    assert.equal(put.status, 503);
+    assert.equal(put.json.error.code, 'DOCKER_UNAVAILABLE');
+
+    const bad = await panel.req('PUT', '/api/ext/machines/shared-desk/access', { headers: AUTH, body: { sharedWith: 'x' } });
+    assert.equal(bad.status, 400, 'body validation still runs first');
+  } finally { panel.kill(); }
+});
+
+test('ext: docker healthy → empty list is 200 and a missing machine is still 404', async () => {
+  await withExtPanel(async (panel) => {
+    await setupAdmin(panel);
+    const list = await panel.req('GET', '/api/ext/machines', { headers: AUTH });
+    assert.equal(list.status, 200);
+    assert.deepEqual(list.json.machines, []);
+
+    const get = await panel.req('GET', '/api/ext/machines/ghost-desk/access', { headers: AUTH });
+    assert.equal(get.status, 404);
+    assert.equal(get.json.error.code, 'NOT_FOUND');
+    const put = await panel.req('PUT', '/api/ext/machines/ghost-desk/access', { headers: AUTH, body: { sharedWith: [] } });
+    assert.equal(put.status, 404);
+    assert.equal(put.json.error.code, 'NOT_FOUND');
+  });
+});
+
 test('ext: user disable/enable + delete revoke access; machine lifecycle action', async () => {
   await withExtPanel(async (panel) => {
     const admin = await setupAdmin(panel)
