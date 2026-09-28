@@ -64,6 +64,13 @@ if (cmd === 'ps') {
   process.exit(0);
 }
 
+if (cmd === 'inspect' && argv[1] === '-f' && argv[2] === '{{.Image}}') {
+  const c = w.containers[argv[3]];
+  if (!c) fail(`Error: No such object: ${argv[3]}`);
+  process.stdout.write(`sha256:fake-${c.image}\n`);
+  process.exit(0);
+}
+
 if (cmd === 'inspect') {
   const ids = argv.slice(1).filter((a) => !a.startsWith('-') && !a.includes('{{'));
   const out = [];
@@ -109,7 +116,11 @@ if (['start', 'stop', 'restart', 'unpause', 'rm'].includes(cmd)) {
   const name = argv.filter((a) => !a.startsWith('-') && a !== String(parseInt(a, 10)))[argv.filter((a) => !a.startsWith('-') && a !== String(parseInt(a, 10))).length - 1];
   const c = w.containers[name];
   if (!c) fail(`Error: No such container: ${name}`);
-  if (cmd === 'start' || cmd === 'restart' || cmd === 'unpause') { c.state = 'running'; c.exitCode = 0; }
+  if (cmd === 'start' || cmd === 'restart' || cmd === 'unpause') {
+    c.state = 'running'; c.exitCode = 0;
+    // A (re)started session picks up the ~/.bashrc time zone hook, like vnc_startup.sh.
+    if (cmd !== 'unpause') c.activeTz = c.tzHook && c.tz ? c.tz : 'Etc/UTC';
+  }
   else if (cmd === 'stop') { c.state = 'exited'; c.exitCode = 0; }
   else if (cmd === 'rm') {
     if (c.state === 'running' && !argv.includes('-f')) fail(`Error response from daemon: You cannot remove a running container ${name}. Stop the container before attempting removal or force remove`);
@@ -149,7 +160,40 @@ if (cmd === 'system' && argv[1] === 'df') {
 // Minimal stubs for the file-transfer paths (exec: no output; cp: success).
 // Enough to exercise routing/authz/validation; real byte movement is covered
 // by the browser E2E, not the fake shim.
-if (cmd === 'exec') process.exit(0);
+// exec: the desktop time zone scripts are acted out against the container
+// record (tz saved, tzHook installed, activeTz of the running session);
+// everything else keeps the old no-output stub.
+if (cmd === 'exec') {
+  const env = {}; let i = 1;
+  for (; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '-e') { const [k, ...v] = argv[++i].split('='); env[k] = v.join('='); }
+    else if (a === '-u' || a === '-w') i++;
+    else if (!a.startsWith('-')) break;
+  }
+  const name = argv[i]; const rest = argv.slice(i + 1);
+  const c = w.containers[name];
+  if (!c) fail(`Error response from daemon: No such container: ${name}`);
+  if (c.state !== 'running') fail(`Error response from daemon: container ${name} is not running`);
+  const script = rest[0] === 'sh' && rest[1] === '-c' ? rest[2] || '' : '';
+  if (rest[0] === 'cat' && rest[1] === '/usr/share/zoneinfo/zone.tab') {
+    process.stdout.write('# tzdata zone.tab\nPH\t+1435+12100\tAsia/Manila\nIN\t+2232+08822\tAsia/Kolkata\nAU\t-3352+15113\tAustralia/Sydney\tNew South Wales\n');
+    process.exit(0);
+  }
+  if (script.includes('PRISM_TZ_MARK')) {
+    const known = new Set(['UTC', 'Asia/Manila', 'Asia/Kolkata', 'Australia/Sydney']);
+    if (!known.has(env.PRISM_TZ)) process.exit(3);
+    c.tz = env.PRISM_TZ;
+    if (!c.tzHook) c.tzHook = env.PRISM_TZ_HOOK || true;
+    save(w);
+    process.exit(0);
+  }
+  if (script.includes('saved=')) {
+    process.stdout.write(`saved=${c.tz || ''}\nactive=${c.activeTz || 'Etc/UTC'}\n`);
+    process.exit(0);
+  }
+  process.exit(0);
+}
 // Archive streams (archived delete / restore):
 //   cp <name>:<dir> -      writes a fake tar of <dir> to stdout
 //   cp -a - <name>:<dest>  reads a tar from stdin and records it on the container

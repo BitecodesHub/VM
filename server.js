@@ -11,7 +11,8 @@ import { execFile, spawn } from 'node:child_process';
 import {
   PANEL_PORT, LOOPBACK, PROTECTED_NAMES, TEMPLATES,
   validateName, validateUsername, firstFreePort, nextName, usedHostPorts,
-  mapContainerToCard, buildRunArgs, parseColimaList, listTemplates,
+  mapContainerToCard, buildRunArgs, parseColimaList, listTemplates, availableTemplates,
+  TZ_HOOK, TZ_HOOK_MARK, TZ_READ_SCRIPT, TZ_WRITE_SCRIPT, validTimeZoneName, parseZoneTab, supportsDesktopTimezone,
   filterMachinesForUser, quotaUsage, pickLanAddress, USER_RUNNING_LIMIT, isPanelMachine,
   machineAccess, canUse, canDelete, canManageAccess, quotaExceeded, QUOTA_STATES,
   backendAuthFor, networkNameFor,
@@ -743,6 +744,7 @@ async function resolveMachine(user, name, need = 'use') {
 async function createMachine(user, template, opts = {}) {
   const t = TEMPLATES[template];
   if (!t) return { status: 400, body: { error: { code: 'VALIDATION', message: 'unknown template' } } };
+  if (t.withdrawn) return { status: 400, body: { error: { code: 'TEMPLATE_WITHDRAWN', message: t.withdrawn } } };
   if (vmTransition) return { status: 503, body: { error: { code: 'COLIMA_TRANSITION', message: 'VM is transitioning' } } };
 
   const isAdmin = user.role === 'admin';
@@ -1260,6 +1262,64 @@ async function readiness(user, name) {
   if (card.state !== 'running' || !card.uiPort) return { status: 200, body: { ready: false, checkedAt: new Date().toISOString() } };
   const ready = await httpProbe(card.uiPort, backendProxyOpts(card).backendTls);
   return { status: 200, body: { ready, url: card.uiUrl, checkedAt: new Date().toISOString() } };
+}
+
+// ---- Desktop time zone (lib/core.js TZ_HOOK) ----------------------------------
+// Zones come from the desktop's own tzdata (zone.tab), cached per image, so a
+// user can only pick a zone the desktop can actually load.
+const zoneListCache = new Map(); // image id -> zone names
+async function desktopZones(name) {
+  const img = await run(DOCKER, ['inspect', '-f', '{{.Image}}', name], TIMEOUTS.read);
+  const key = img.ok ? img.stdout.trim() : null;
+  if (key && zoneListCache.has(key)) return zoneListCache.get(key);
+  const r = await run(DOCKER, ['exec', '-u', '1000', name, 'cat', '/usr/share/zoneinfo/zone.tab'], TIMEOUTS.read);
+  const zones = r.ok ? parseZoneTab(r.stdout) : ['UTC'];
+  if (key && r.ok) zoneListCache.set(key, zones);
+  return zones;
+}
+
+async function getDesktopTimezone(user, name) {
+  const resolved = await resolveMachine(user, name, 'use');
+  if (resolved.error) return resolved.error;
+  const { card } = resolved;
+  if (!supportsDesktopTimezone(card.template)) return { status: 400, body: { error: { code: 'UNSUPPORTED', message: 'Only Linux desktops have a time zone setting.' } } };
+  if (card.state !== 'running') return { status: 200, body: { name, running: false, timeZone: null, activeTimeZone: null, pendingRestart: false, zones: [] } };
+  const home = homeDirFor(card.template);
+  const r = await run(DOCKER, ['exec', '-u', '1000', '-e', `PRISM_HOME=${home}`, name, 'sh', '-c', TZ_READ_SCRIPT], TIMEOUTS.read);
+  if (!r.ok) return { status: 502, body: { error: { code: 'VM_ERROR', message: 'Could not read the desktop time zone.' } } };
+  const field = (k) => ((r.stdout.match(new RegExp(`^${k}=(.*)$`, 'm')) || [])[1] || '').trim();
+  const saved = field('saved');
+  const active = field('active');
+  // Nothing saved: the image default (UTC). Etc/UTC and UTC are the same zone.
+  const norm = (z) => (!z || z === 'Etc/UTC' ? 'UTC' : z);
+  const timeZone = validTimeZoneName(saved) ? saved : 'UTC';
+  const activeTimeZone = validTimeZoneName(active) ? norm(active) : null;
+  return { status: 200, body: { name, running: true, timeZone, activeTimeZone, pendingRestart: activeTimeZone !== null && norm(timeZone) !== activeTimeZone, zones: await desktopZones(name) } };
+}
+
+// Save a desktop's time zone and, by default, restart it so the session picks
+// it up (open apps close — callers confirm that with the user first).
+async function setDesktopTimezone(user, name, timeZone, { restart = true, via = null } = {}) {
+  if (!validTimeZoneName(timeZone)) return { status: 400, body: { error: { code: 'VALIDATION', message: 'invalid time zone' } } };
+  const resolved = await resolveMachine(user, name, 'use');
+  if (resolved.error) return resolved.error;
+  const { card } = resolved;
+  if (!supportsDesktopTimezone(card.template)) return { status: 400, body: { error: { code: 'UNSUPPORTED', message: 'Only Linux desktops have a time zone setting.' } } };
+  if (card.state !== 'running') return { status: 409, body: { error: { code: 'NOT_RUNNING', message: 'Start the desktop before changing its time zone.' } } };
+  if (inFlight.has(name)) return { status: 409, body: { error: { code: 'JOB_IN_FLIGHT', message: 'another action is in progress' } } };
+  const home = homeDirFor(card.template);
+  const r = await run(DOCKER, ['exec', '-u', '1000',
+    '-e', `PRISM_TZ=${timeZone}`, '-e', `PRISM_HOME=${home}`, '-e', `PRISM_TZ_MARK=${TZ_HOOK_MARK}`, '-e', `PRISM_TZ_HOOK=${TZ_HOOK}`,
+    name, 'sh', '-c', TZ_WRITE_SCRIPT], TIMEOUTS.mutate);
+  if (!r.ok) {
+    if (r.code === 3) return { status: 400, body: { error: { code: 'UNKNOWN_TIME_ZONE', message: `This desktop does not know the time zone ${timeZone}.` } } };
+    return { status: 502, body: { error: { code: 'VM_ERROR', message: 'Could not save the desktop time zone.' } } };
+  }
+  recordAudit(null, user.username, 'machine.timezone', name, { timeZone, restart: !!restart, ...(via ? { via } : {}) });
+  if (!restart) return { status: 200, body: { ok: true, name, timeZone, restarted: false } };
+  const out = await lifecycle(user, name, 'restart');
+  if (out.status >= 300) return { status: out.status, body: { ...out.body, saved: true } };
+  return { status: 200, body: { ok: true, name, timeZone, restarted: true } };
 }
 
 // ---- File transfer (docker cp) ---------------------------------------------
@@ -1923,7 +1983,7 @@ const server = http.createServer(async (req, res) => {
     if (rawPath === '/api/state' && method === 'GET') {
       return sendJson(res, 200, await getState(auth.user));
     }
-    if (rawPath === '/api/templates' && method === 'GET') return sendJson(res, 200, listTemplates());
+    if (rawPath === '/api/templates' && method === 'GET') return sendJson(res, 200, availableTemplates());
     if (rawPath === '/api/machines' && method === 'POST') {
       const body = await readJson(req);
       if (!body) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'invalid JSON' } });
@@ -2328,7 +2388,7 @@ async function handleExtApi(req, res, rawPath, method) {
   // has to leave PRISM. All calls act as an admin; PRISM gates them on manage_vms.
   const url = new URL(req.url, `http://${LOOPBACK}`);
 
-  if (sub === '/templates' && method === 'GET') return sendJson(res, 200, { templates: listTemplates() });
+  if (sub === '/templates' && method === 'GET') return sendJson(res, 200, { templates: availableTemplates() });
 
   // Delete. Body { confirm: <name>, archive?: boolean (default true), actor? }.
   // With archive (the default) this returns 202 + a job; poll /jobs/<id>.
@@ -2394,6 +2454,17 @@ async function handleExtApi(req, res, rawPath, method) {
   if ((m = sub.match(/^\/machines\/([^/]+)\/ready$/)) && method === 'GET') {
     const out = await readiness(EXT_ACTOR, decodeURIComponent(m[1]));
     return sendJson(res, out.status, out.body);
+  }
+  if ((m = sub.match(/^\/machines\/([^/]+)\/timezone$/))) {
+    const name = decodeURIComponent(m[1]);
+    if (method === 'GET') { const out = await getDesktopTimezone(EXT_ACTOR, name); return sendJson(res, out.status, out.body); }
+    if (method === 'PUT') {
+      const body = await readJson(req);
+      if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+      const actor = typeof body?.actor === 'string' ? body.actor.slice(0, 120) : null;
+      const out = await setDesktopTimezone(EXT_ACTOR, name, body?.timeZone, { restart: body?.restart !== false, via: actor ? `prism:${actor}` : 'prism' });
+      return sendJson(res, out.status, out.body);
+    }
   }
   if ((m = sub.match(/^\/machines\/([^/]+)\/stats$/)) && method === 'GET') {
     const out = await getMachineStats(EXT_ACTOR, decodeURIComponent(m[1]));
