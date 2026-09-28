@@ -13,7 +13,7 @@ import {
   validateName, validateUsername, firstFreePort, nextName, usedHostPorts,
   mapContainerToCard, buildRunArgs, parseColimaList, listTemplates, availableTemplates,
   TZ_HOOK, TZ_HOOK_MARK, TZ_READ_SCRIPT, TZ_WRITE_SCRIPT, validTimeZoneName, parseZoneTab, supportsDesktopTimezone,
-  templateDefaultResources, resourceBounds, validateResources,
+  templateDefaultResources, resourceBounds, validateResources, clampResources,
   filterMachinesForUser, quotaUsage, pickLanAddress, USER_RUNNING_LIMIT, isPanelMachine,
   machineAccess, canUse, canDelete, canManageAccess, quotaExceeded, QUOTA_STATES,
   backendAuthFor, networkNameFor,
@@ -35,7 +35,7 @@ import { AuditLog } from './lib/audit.js';
 import { sweepStale } from './lib/tmpsweep.js';
 import { validatePassword, LoginLimiter, RateLimiter } from './lib/auth.js';
 import {
-  parseProxyPath, isAllowedHost, isAllowedOrigin, errorPage, proxyHttp, proxyUpgrade, staticAssetPolicy, etagMatches,
+  parseProxyPath, isAllowedHost, isAllowedOrigin, errorPage, proxyHttp, proxyUpgrade, isStaticAsset,
 } from './lib/proxy.js';
 import {
   parseDockerStats, parseSystemDf, parsePsSizes, shapeMachineStats, buildResourcesPayload,
@@ -861,7 +861,7 @@ async function createMachine(user, template, opts = {}) {
           invalidateMachineCache();
           if (viewers.length) { try { await shares.setList(name, viewers); } catch { /* machine created; sharing is best-effort */ } }
           const uiUrl = `/m/${name}${t.ui.path}` + (t.ui.path.includes('?') ? '&' : '?') + `path=${encodeURIComponent(`m/${name}/websockify`)}` + (t.ui.password.mode === 'query' ? `&password=${encodeURIComponent(t.ui.password.value)}` : '');
-          return { status: 202, body: { ok: true, name, uiUrl, sharedWith: viewers } };
+          return { status: 202, body: { ok: true, name, uiUrl, sharedWith: viewers, limits: cap && resources ? resources : null } };
         }
         // A fixed custom name cannot be auto-incremented away — surface the clash.
         if (/name .*already in use|Conflict|is already in use by container/i.test(r.stderr)) {
@@ -1188,7 +1188,9 @@ async function restoreArchive(id, { name: wantName, owner: wantOwner } = {}) {
     try {
       const viewers = entry.sharedWith.filter((v) => v !== owner && users.get(v));
       // Bring the desktop back with the limits it had, when they still fit this host.
-      const kept = entry.limits && validateResources(entry.limits, hostResourceBounds()).ok ? entry.limits : null;
+      const bounds = hostResourceBounds();
+      const kept = entry.limits ? (validateResources(entry.limits, bounds).ok ? entry.limits : clampResources(entry.limits, bounds)) : null;
+      const limitsAdjusted = !!entry.limits && (kept.cpus !== entry.limits.cpus || kept.memoryMiB !== entry.limits.memoryMiB);
       const out = await createMachine({ username: owner, role: 'admin' }, entry.template, { name, viewers, ...(kept ? { resources: kept } : {}) });
       if (out.status >= 300) throw new JobError(out.body?.error?.code || 'CREATE_FAILED', out.body?.error?.message || 'The desktop could not be created.');
       inFlight.add(name);
@@ -1211,8 +1213,8 @@ async function restoreArchive(id, { name: wantName, owner: wantOwner } = {}) {
         if (entry.displayName) await machineMeta.setDisplayName(name, entry.displayName).catch(() => {});
         await archives.remove(id);
         invalidateMachineCache();
-        audit.record({ actor: 'prism', action: 'machine.restore', target: name, detail: { via: 'ext', archive: id, owner }, ip: null });
-        return { name, owner, started: started.ok, archive: id, ref: entry.ref };
+        audit.record({ actor: 'prism', action: 'machine.restore', target: name, detail: { via: 'ext', archive: id, owner, limits: kept, limitsAdjusted }, ip: null });
+        return { name, owner, started: started.ok, archive: id, ref: entry.ref, limits: kept, limitsAdjusted };
       } finally {
         inFlight.delete(name);
       }
@@ -1410,17 +1412,23 @@ async function updateMachineResources(user, name, body, { req = null, via = null
   if (!v.ok) return { status: 400, body: { error: { code: 'VALIDATION', message: v.error } } };
   const { cpus, memoryMiB } = v.value;
   if (inFlight.has(name)) return { status: 409, body: { error: { code: 'JOB_IN_FLIGHT', message: 'another action is in progress' } } };
-  if (card.state === 'running' && card.limits?.memoryMiB !== memoryMiB) {
-    let used = null;
-    try { used = (await statsCache.get()).value?.data?.byName?.get(name)?.memUsedBytes ?? null; } catch { used = null; }
-    if (used != null && memoryMiB * MiB < used + 256 * MiB) {
-      const need = Math.ceil((used / MiB + 256) / 256) * 256;
-      return { status: 409, body: { error: { code: 'MEMORY_IN_USE', message: `This desktop is using ${fmtGiB(used / MiB)} right now. Choose at least ${fmtGiB(need)}, or stop the desktop first.` }, minMemoryMiB: need } };
-    }
-  }
   inFlight.add(name);
   let r;
   try {
+    // Lowering memory on a running desktop: check what it uses now. With no
+    // reading (stats down or stale) refuse rather than guess — the kernel would
+    // kill its apps if the new limit is below its use.
+    const current = card.limits?.memoryMiB ?? null;
+    if (card.state === 'running' && (current == null || memoryMiB < current)) {
+      let used = null;
+      const sr = await run(DOCKER, ['stats', '--no-stream', '--format', '{{json .}}', name], TIMEOUTS.stats);
+      if (sr.ok) { try { used = parseDockerStats(sr.stdout).byName.get(name)?.memUsedBytes ?? null; } catch { used = null; } }
+      if (used == null) return { status: 503, body: { error: { code: 'STATS_UNAVAILABLE', message: 'Could not read how much memory this desktop is using, so its memory was not lowered. Try again in a moment, or stop the desktop first.' } } };
+      if (memoryMiB * MiB < used + 256 * MiB) {
+        const need = Math.ceil((used / MiB + 256) / 256) * 256;
+        return { status: 409, body: { error: { code: 'MEMORY_IN_USE', message: `This desktop is using ${fmtGiB(used / MiB)} right now. Choose at least ${fmtGiB(need)}, or stop the desktop first.` }, minMemoryMiB: need } };
+      }
+    }
     r = await run(DOCKER, ['update', '--cpus', String(cpus), '--memory', `${memoryMiB}m`, '--memory-swap', `${memoryMiB}m`, name], TIMEOUTS.mutate);
     invalidateMachineCache();
   } finally {
@@ -2463,7 +2471,7 @@ async function handleExtApi(req, res, rawPath, method) {
     // Act as an admin-capable actor OWNED by the target (custom name/viewers OK,
     // no per-user quota) — provisioning is an administrative operation.
     const out = await createMachine({ username: owner, role: 'admin' }, body.template, { name: body.name, viewers: body.viewers, cap: body.cap, resources: body.resources });
-    if (out.status < 300) { invalidateMachineCache(); recordAudit(req, 'prism', 'machine.create', out.body?.name || body.name || null, { template: body.template, owner, via: 'ext', ...(body.resources ? { resources: body.resources } : {}) }); }
+    if (out.status < 300) { invalidateMachineCache(); recordAudit(req, 'prism', 'machine.create', out.body?.name || body.name || null, { template: body.template, owner, via: 'ext', limits: out.body?.limits ?? null }); }
     return sendJson(res, out.status, out.body);
   }
 
@@ -2656,31 +2664,41 @@ async function handleExtApi(req, res, rawPath, method) {
   if (sub === '/settings') {
     if (method === 'GET') return sendJson(res, 200, extSettingsBody());
     if (method === 'PATCH') {
-      const body = await readJson(req);
-      if (!body) return sendJson(res, 400, EXT_BAD_JSON);
-      const v = validateExtSettingsPatch(body);
-      if (!v.ok) return sendJson(res, 400, { error: { code: 'VALIDATION', message: v.error } });
-      if (v.patch.resourceDefaults) {
-        const bounds = hostResourceBounds();
-        const merged = { ...(config.resourceDefaults || {}) };
-        for (const [tid, r] of Object.entries(v.patch.resourceDefaults)) {
-          if (!TEMPLATES[tid] || TEMPLATES[tid].withdrawn) return sendJson(res, 400, { error: { code: 'VALIDATION', message: `unknown template "${tid}"` } });
-          const rv = validateResources(r, bounds);
-          if (!rv.ok) return sendJson(res, 400, { error: { code: 'VALIDATION', message: `${tid}: ${rv.error}` } });
-          merged[tid] = rv.value;
-        }
-        v.patch.resourceDefaults = merged;
-      }
-      try { await persistConfigPatch(DATA_DIR, v.patch, { atomicWriteJson }); }
-      catch (e) { return sendJson(res, 500, { error: { code: 'CONFIG_WRITE_FAILED', message: String(e?.message || e).slice(0, 200) } }); }
-      const before = Object.fromEntries(Object.keys(v.patch).map((k) => [k, config[k]]));
-      Object.assign(config, v.patch);
-      recordAudit(req, 'prism', 'settings.update', null, { before, after: v.patch, via: 'ext' });
-      return sendJson(res, 200, extSettingsBody());
+      // One settings write at a time: resourceDefaults is merged from the
+      // current value, so two overlapping PATCHes must not overwrite each other.
+      const prev = settingsWriteChain;
+      let release;
+      settingsWriteChain = new Promise((r) => { release = r; });
+      await prev;
+      try { return await patchExtSettings(req, res); } finally { release(); }
     }
   }
-
   return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: 'no such endpoint' } });
+}
+
+let settingsWriteChain = Promise.resolve();
+async function patchExtSettings(req, res) {
+  const body = await readJson(req);
+  if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+  const v = validateExtSettingsPatch(body);
+  if (!v.ok) return sendJson(res, 400, { error: { code: 'VALIDATION', message: v.error } });
+  if (v.patch.resourceDefaults) {
+    const bounds = hostResourceBounds();
+    const merged = { ...(config.resourceDefaults || {}) };
+    for (const [tid, r] of Object.entries(v.patch.resourceDefaults)) {
+      if (!TEMPLATES[tid] || TEMPLATES[tid].withdrawn) return sendJson(res, 400, { error: { code: 'VALIDATION', message: `unknown template "${tid}"` } });
+      const rv = validateResources(r, bounds);
+      if (!rv.ok) return sendJson(res, 400, { error: { code: 'VALIDATION', message: `${tid}: ${rv.error}` } });
+      merged[tid] = rv.value;
+    }
+    v.patch.resourceDefaults = merged;
+  }
+  try { await persistConfigPatch(DATA_DIR, v.patch, { atomicWriteJson }); }
+  catch (e) { return sendJson(res, 500, { error: { code: 'CONFIG_WRITE_FAILED', message: String(e?.message || e).slice(0, 200) } }); }
+  const before = Object.fromEntries(Object.keys(v.patch).map((k) => [k, config[k]]));
+  Object.assign(config, v.patch);
+  recordAudit(req, 'prism', 'settings.update', null, { before, after: v.patch, via: 'ext' });
+  return sendJson(res, 200, extSettingsBody());
 }
 
 // Redeem a one-time SSO token (browser GET on the machine origin): set an embed
@@ -3037,19 +3055,11 @@ async function handleProxy(req, res, setUser) {
   if (card.localOnly || !card.uiPort) return sendMachineHtml(req, res, 502, errorPage(502, 'Not available here', 'This machine can only be opened on the host Mac.', { back: false }));
   if (card.state !== 'running') return sendMachineHtml(req, res, 502, errorPage(502, 'Desktop is stopped', `“${parsed.name}” is not running. Press Reload in PRISM to start it again.`, { back: false }));
   const route = proxyRoute(card, parsed);
-  // Static viewer assets: answer a matching revalidation here (304, the backend
-  // is not asked), and let the browser keep them; see staticAssetPolicy.
-  const asset = (req.method === 'GET' || req.method === 'HEAD') && route.port === card.uiPort
-    ? staticAssetPolicy(route.target, card.imageId, (x) => crypto.createHash('sha1').update(x).digest('hex'))
-    : null;
-  if (asset && etagMatches(req.headers['if-none-match'], asset.etag)) {
-    res.writeHead(304, { ETag: asset.etag, 'Cache-Control': asset.cacheControl, 'X-Content-Type-Options': 'nosniff' });
-    return res.end();
-  }
   proxyHttp({
     req, res, port: route.port, target: route.target, name: parsed.name, frameAncestors: panelFrameAncestors(req), ...backendProxyOpts(card),
     onBackendResponse: () => touchMachine(parsed.name), // idle-reaper activity signal
-    cacheHeaders: asset ? { 'Cache-Control': asset.cacheControl, ETag: asset.etag } : null,
+    // Static viewer files: revalidated by content hash (lib/proxy.js isStaticAsset).
+    validateAsset: req.method === 'GET' && route.port === card.uiPort && isStaticAsset(route.target),
   });
 }
 

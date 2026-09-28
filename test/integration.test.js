@@ -726,36 +726,73 @@ test('readiness: a TLS (KasmVNC) backend is probed over HTTPS and reports ready'
   } finally { backend.close(); }
 });
 
-test('proxy: static viewer assets get image-scoped validators; a match is answered 304 without the backend', async () => {
-  const backend = await startBackend();
+test('proxy: static viewer files are revalidated by content hash; changed bytes are always served fresh', async () => {
+  // A backend whose body can change, counting requests, like a KasmVNC web server.
+  const state = { body: 'console.log("v1")', hits: 0 };
+  const srv = https.createServer({ cert: TEST_BACKEND_CERT, key: TEST_BACKEND_KEY }, (req, res) => {
+    state.hits++;
+    const type = req.url.includes('.js') ? 'application/javascript' : 'text/html';
+    res.writeHead(200, { 'Content-Type': type, ETag: '"backend-own"', 'Last-Modified': 'Mon, 01 Jan 2001 00:00:00 GMT' }); res.end(state.body);
+  });
+  const port = await new Promise((resolve) => srv.listen(0, '127.0.0.1', () => resolve(srv.address().port)));
   try {
-    await withPanel({ world: seedMachine('alice', backend.port) }, async (panel) => {
+    await withPanel({ world: seedMachine('alice', port) }, async (panel) => {
       const admin = await setupAdmin(panel);
       await panel.req('POST', '/api/users', { cookie: admin, body: { username: 'alice', password: PW, role: 'user' } });
       const alice = await activate(panel, 'alice', PW);
 
       const js = await panel.req('GET', '/m/desktop-1/main.bundle.js', { cookie: alice, machine: true });
       assert.equal(js.status, 200);
+      assert.equal(js.text, 'console.log("v1")');
       assert.equal(js.headers.get('cache-control'), 'private, no-cache');
       const etag = js.headers.get('etag');
-      assert.match(etag || '', /^W\/"[0-9a-z]{1,12}-[0-9a-f]{16}"$/);
-      const chunk = await panel.req('GET', '/m/desktop-1/assets/webutil-DUkojxeL.js', { cookie: alice, machine: true });
-      assert.match(chunk.headers.get('cache-control') || '', /immutable/);
+      assert.match(etag || '', /^"c-[0-9a-f]{24}"$/, 'our content tag, not the backend\'s');
+      assert.equal(js.headers.get('last-modified'), null);
+      assert.match(js.headers.get('content-security-policy') || '', /frame-ancestors/);
+
       const html = await panel.req('GET', '/m/desktop-1/vnc.html', { cookie: alice, machine: true });
       assert.equal(html.headers.get('cache-control'), 'no-store', 'the viewer page itself is never cached');
-      assert.equal(html.headers.get('etag'), null);
 
-      backend.state.lastHeaders = null;
-      for (const inm of [etag, etag.replace(/"$/, '-zstd"'), `"other", ${etag}`]) {
+      // Same bytes: 304, no body, but the desktop WAS asked (nothing is trusted blindly).
+      const hitsBefore = state.hits;
+      for (const inm of [etag, etag.replace(/"$/, '-zstd"'), `W/${etag}`, `"other", ${etag}`]) {
         const again = await panel.req('GET', '/m/desktop-1/main.bundle.js', { cookie: alice, machine: true, headers: { 'If-None-Match': inm } });
         assert.equal(again.status, 304, inm);
+        assert.equal(again.text, '');
         assert.equal(again.headers.get('etag'), etag);
       }
-      assert.equal(backend.state.lastHeaders, null, 'the desktop was not asked');
-      const stale = await panel.req('GET', '/m/desktop-1/main.bundle.js', { cookie: alice, machine: true, headers: { 'If-None-Match': 'W/"nope"' } });
-      assert.equal(stale.status, 200, 'a different tag gets the file');
-      // Still authenticated: no cookie, no 304.
+      assert.equal(state.hits, hitsBefore + 4, 'every revalidation fetched from the desktop');
+
+      // The desktop now serves different bytes: the old tag no longer matches.
+      state.body = 'console.log("tampered or rebuilt")';
+      const fresh = await panel.req('GET', '/m/desktop-1/main.bundle.js', { cookie: alice, machine: true, headers: { 'If-None-Match': etag } });
+      assert.equal(fresh.status, 200);
+      assert.equal(fresh.text, 'console.log("tampered or rebuilt")');
+      assert.notEqual(fresh.headers.get('etag'), etag);
+
+      // Still authenticated: no cookie, no file and no 304.
       assert.notEqual((await panel.req('GET', '/m/desktop-1/main.bundle.js', { machine: true, headers: { 'If-None-Match': etag } })).status, 304);
     });
-  } finally { backend.close(); }
+  } finally { srv.close(); }
+});
+
+test('proxy: a static file too big to tag is streamed whole, untagged', async () => {
+  const big = Buffer.alloc(9 * 1024 * 1024, 97); // over STATIC_ASSET_MAX_BYTES, no Content-Length
+  const srv = https.createServer({ cert: TEST_BACKEND_CERT, key: TEST_BACKEND_KEY }, (req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/javascript' });
+    let off = 0; const step = () => { if (off >= big.length) return res.end(); res.write(big.subarray(off, off + 65536)); off += 65536; setImmediate(step); }; step();
+  });
+  const port = await new Promise((resolve) => srv.listen(0, '127.0.0.1', () => resolve(srv.address().port)));
+  try {
+    await withPanel({ world: seedMachine('alice', port) }, async (panel) => {
+      const admin = await setupAdmin(panel);
+      await panel.req('POST', '/api/users', { cookie: admin, body: { username: 'alice', password: PW, role: 'user' } });
+      const alice = await activate(panel, 'alice', PW);
+      const r = await panel.req('GET', '/m/desktop-1/huge.js', { cookie: alice, machine: true });
+      assert.equal(r.status, 200);
+      assert.equal(r.text.length, big.length, 'nothing cut off');
+      assert.equal(r.headers.get('etag'), null);
+      assert.equal(r.headers.get('cache-control'), 'no-store');
+    });
+  } finally { srv.close(); }
 });

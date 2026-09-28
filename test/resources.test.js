@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import {
   resourceBounds, validateResources, parseMemoryMiB, templateDefaultResources, buildRunArgs, mapContainerToCard,
 } from '../lib/core.js';
-import { staticAssetPolicy, etagMatches } from '../lib/proxy.js';
+import { isStaticAsset, contentEtag, etagMatches } from '../lib/proxy.js';
 import { spawnPanel, setupAdmin } from './helpers/spawn-panel.js';
 
 const TOKEN = 'prism-ext-token-abcdefghijklmnop';
@@ -58,16 +58,13 @@ test('card: reports the limits Docker enforces now', () => {
   assert.deepEqual(open.limits, { cpus: null, memoryMiB: null });
 });
 
-test('static assets: hashed chunks are immutable, other files revalidate per image, HTML is never cached', () => {
-  const h = (x) => `h${x.length}0000000000000000000`;
-  const hashed = staticAssetPolicy('/assets/webutil-DUkojxeL.js', 'sha256:d15174224546f79', h);
-  assert.match(hashed.cacheControl, /immutable/);
-  assert.match(hashed.etag, /^W\/"d15174224546-/);
-  assert.equal(staticAssetPolicy('/main.bundle.js?v=2', 'sha256:d15174224546f79', h).cacheControl, 'private, no-cache');
-  assert.equal(staticAssetPolicy('/vnc.html', 'sha256:x', h), null);
-  assert.equal(staticAssetPolicy('/websockify', 'sha256:x', h), null);
-  assert.equal(staticAssetPolicy('/main.bundle.js', null, h), null, 'no image id, no validator');
-  assert.notEqual(staticAssetPolicy('/main.bundle.js', 'sha256:aaaaaaaaaaaa1', h).etag, staticAssetPolicy('/main.bundle.js', 'sha256:bbbbbbbbbbbb1', h).etag, 'a rebuilt image changes the tag');
+test('static assets: which files are revalidated by content, and the tag is the content hash', () => {
+  for (const p of ['/main.bundle.js', '/assets/webutil-DUkojxeL.js?v=1', '/assets/x.css', '/jsmpeg.min.js', '/assets/splash-D03O8R4K.jpg', '/assets/Orbitron700-DI3tXiXq.woff']) assert.ok(isStaticAsset(p), p);
+  for (const p of ['/vnc.html', '/', '/websockify', '/kasmaudio', '/api/get_frame_stats']) assert.ok(!isStaticAsset(p), p);
+  const a = contentEtag(Buffer.from('one')); const b = contentEtag(Buffer.from('two'));
+  assert.match(a, /^"c-[0-9a-f]{24}"$/);
+  assert.notEqual(a, b, 'different bytes, different tag');
+  assert.equal(a, contentEtag(Buffer.from('one')), 'same bytes, same tag');
 });
 
 test('static assets: If-None-Match matching is tolerant of W/, lists and compression suffixes', () => {
@@ -149,4 +146,19 @@ test('ext: resource defaults, create with explicit or default limits, live edit,
     assert.equal(panel.readWorld().containers['big-desk'].memoryBytes, 4096 * 1048576, 'restored at its old size');
     assert.equal(panel.readWorld().containers['big-desk'].nanoCpus, 2e9);
   } finally { panel.kill(); }
+});
+
+test('resource validation: booleans and arrays are not numbers; restored limits are clamped, not dropped', async () => {
+  const { clampResources } = await import('../lib/core.js');
+  const b = resourceBounds(2, 7802);
+  for (const bad of [{ cpus: true, memoryMiB: 2048 }, { cpus: [2], memoryMiB: 2048 }, { cpus: 1, memoryMiB: [2048] }, { cpus: '', memoryMiB: 2048 }]) assert.equal(validateResources(bad, b).ok, false, JSON.stringify(bad));
+  assert.deepEqual(clampResources({ cpus: 8, memoryMiB: 32768 }, b), { cpus: 2, memoryMiB: 6656 });
+  assert.deepEqual(clampResources({ cpus: 0.1, memoryMiB: 300 }, b), { cpus: 0.5, memoryMiB: 1024 });
+  assert.deepEqual(validateResources({ cpus: 1.5000000001, memoryMiB: 2048 }, b).value, { cpus: 1.5, memoryMiB: 2048 }, 'snapped to the step');
+});
+
+test('static assets: files in the desktop user\'s Downloads share are never tagged', () => {
+  assert.equal(isStaticAsset('/Downloads/report.json'), false);
+  assert.equal(isStaticAsset('/Downloads/'), false);
+  assert.equal(isStaticAsset('/downloads/x.png'), false);
 });
