@@ -72,7 +72,9 @@ test('boot restore (integration): after a reboot the panel restarts the desktops
   });
   try {
     let world;
-    for (let i = 0; i < 50; i++) {
+    // Under a loaded test run the first docker snapshot can be stale, and the
+    // restore then waits for the next one (5 s backoff): allow for that.
+    for (let i = 0; i < 250; i++) {
       // fake docker rewrites the world file while it runs: a torn read is not a result.
       try { world = panel.readWorld(); } catch { world = null; }
       if (world?.containers['was-on'].state === 'running') break;

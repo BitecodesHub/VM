@@ -163,3 +163,64 @@ test('ext: desktop time zone read, set (restarts), pending, refusals, withdrawn 
     assert.ok(tzEvents.length >= 2, 'audited');
   } finally { panel.kill(); }
 });
+
+test('ext: a restart that fails after the save reports saved-not-applied, and the audit says so', async () => {
+  const panel = await spawnPanel({ env: { VMP_PANEL_API_TOKEN: TOKEN, FAKE_DOCKER_RESTART_FAIL: '1' } });
+  try {
+    const admin = await setupAdmin(panel);
+    assert.equal((await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop', name: 'tz-fail' } })).status, 202);
+    for (let i = 0; i < 50; i++) { let w; try { w = panel.readWorld(); } catch { w = null; } if (w?.containers['tz-fail']?.state === 'running') break; await new Promise((r) => setTimeout(r, 100)); }
+    const r = await panel.req('PUT', '/api/ext/machines/tz-fail/timezone', { headers: AUTH, body: { timeZone: 'Asia/Manila' } });
+    assert.equal(r.status, 200, JSON.stringify(r.json));
+    assert.equal(r.json.restarted, false);
+    assert.equal(r.json.restartError.code, 'DOCKER_CLI_ERROR');
+    assert.equal(panel.readWorld().containers['tz-fail'].tz, 'Asia/Manila', 'the zone itself was saved');
+    const audit = await panel.req('GET', '/api/ext/audit?limit=50', { headers: AUTH });
+    const ev = (audit.json.entries || audit.json.events || []).find((e) => e.action === 'machine.timezone');
+    assert.equal(ev.detail.restarted, false);
+    assert.equal(ev.detail.restartError, 'DOCKER_CLI_ERROR');
+    assert.ok(ev.ip, 'caller address recorded');
+  } finally { panel.kill(); }
+});
+
+test('panel stop parks the restart policy at no; start puts on-failure back', async () => {
+  const panel = await spawnPanel({ env: { VMP_PANEL_API_TOKEN: TOKEN } });
+  try {
+    const admin = await setupAdmin(panel);
+    assert.equal((await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop', name: 'pol-desk' } })).status, 202);
+    for (let i = 0; i < 50; i++) { let w; try { w = panel.readWorld(); } catch { w = null; } if (w?.containers['pol-desk']?.state === 'running') break; await new Promise((r) => setTimeout(r, 100)); }
+    assert.ok((await panel.req('POST', '/api/ext/machines/pol-desk/action', { headers: AUTH, body: { action: 'stop' } })).status < 300);
+    let c = panel.readWorld().containers['pol-desk'];
+    assert.equal(c.state, 'exited');
+    assert.equal(c.restart, 'no', 'Docker will not bring a user-stopped desktop back');
+    assert.ok((await panel.req('POST', '/api/ext/machines/pol-desk/action', { headers: AUTH, body: { action: 'start' } })).status < 300);
+    c = panel.readWorld().containers['pol-desk'];
+    assert.equal(c.state, 'running');
+    assert.equal(c.restart, 'on-failure');
+    assert.deepEqual(c.updates, ['no', 'on-failure:3']);
+  } finally { panel.kill(); }
+});
+
+test('withdrawn templates: no kept copy on delete, and an old copy is refused before any job starts', async () => {
+  const node = { id: 'n1', image: 'local-seleniarm/standalone-chromium:4.5.0-20260701', state: 'running', labels: { 'vmpanel.managed': '1', 'vmpanel.template': 'chrome-node', 'vmpanel.owner': 'admin', 'vmpanel.ui.port': '7901' } };
+  const id = '0123456789abcdef';
+  const future = new Date(Date.now() + 5 * 86_400_000).toISOString();
+  const panel = await spawnPanel({
+    env: { VMP_PANEL_API_TOKEN: TOKEN },
+    world: { nextId: 5, containers: { 'chrome-node-1': node } },
+    files: {
+      'archives/index.json': { version: 1, archives: { [id]: { id, machine: 'old-node', template: 'chrome-node', owner: 'admin', sharedWith: [], homeDir: '/home/seluser', bytes: 10, deletedAt: new Date().toISOString(), expiresAt: future } } },
+      [`archives/${id}.tar.gz`]: 'x',
+    },
+  });
+  try {
+    await setupAdmin(panel);
+    const del = await panel.req('DELETE', '/api/ext/machines/chrome-node-1', { headers: AUTH, body: { confirm: 'chrome-node-1', archive: true } });
+    assert.equal(del.status, 400);
+    assert.equal(del.json.error.code, 'ARCHIVE_UNSUPPORTED');
+    assert.equal(panel.readWorld().containers['chrome-node-1'].state, 'running', 'nothing stopped');
+    const restore = await panel.req('POST', `/api/ext/archives/${id}/restore`, { headers: AUTH, body: {} });
+    assert.equal(restore.status, 409);
+    assert.equal(restore.json.error.code, 'ARCHIVE_TEMPLATE_WITHDRAWN');
+  } finally { panel.kill(); }
+});

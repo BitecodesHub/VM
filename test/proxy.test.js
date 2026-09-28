@@ -177,3 +177,14 @@ test('errorPage renders self-contained html', () => {
   assert.ok(html.includes('It may be stopped.'));
   assert.ok(html.startsWith('<!doctype html>'));
 });
+
+test('errorPage: a self-retrying page stops after a bounded number of tries and has no meta refresh', async () => {
+  const { errorPage } = await import('../lib/proxy.js');
+  const html = errorPage(502, 'Desktop is starting', 'retrying', { back: false, refreshSec: 4 });
+  assert.doesNotMatch(html, /http-equiv="refresh"/);
+  assert.match(html, /vmp_retry:/);
+  assert.match(html, /n>=30/);
+  assert.match(html, /location\.reload\(\)\},4000\)/);
+  assert.doesNotMatch(html, /Back to PRISM Virtual Desktop/);
+  assert.doesNotMatch(errorPage(404, 'x', 'y'), /<script>/, 'no script unless asked');
+});

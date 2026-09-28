@@ -260,15 +260,18 @@ function recordLastRunning(byName) {
 const BOOT_ACTOR = { username: 'boot-restore', role: 'admin' };
 async function runBootRestore() {
   try {
-    // Docker may still be coming up after a reboot: wait for a fresh snapshot.
+    // Docker may still be coming up after a reboot: wait for a fresh snapshot
+    // for as long as it takes. Until then the tick does not overwrite the
+    // record (bootRestoreDone stays false), so a slow Docker loses nothing.
     let snap = null;
-    for (let i = 0; i < 20 && !shuttingDown; i++) {
+    for (let i = 0; !shuttingDown; i++) {
       try { snap = await cardsCached(); } catch { snap = null; }
       if (snap && !snap.stale) break;
       snap = null;
-      await new Promise((r) => setTimeout(r, 15_000));
+      if (i === 20) console.error('[VMP_BOOT_RESTORE] docker is still not answering; waiting');
+      await new Promise((r) => setTimeout(r, Math.min(60_000, 5_000 * (i + 1))));
     }
-    if (!snap) { console.error('[VMP_BOOT_RESTORE] docker never answered; nothing restored'); return; }
+    if (!snap) return; // shutting down
     const plan = planBootRestore(bootRestoreLast, BOOT_ID, snap.byName, { maxRunning: config.maxRunningMachines, isPanelMachine });
     if (bootRestoreLast?.bootId && bootRestoreLast.bootId !== BOOT_ID) {
       console.log(`[VMP_BOOT_RESTORE] host rebooted; ${plan.length} of ${bootRestoreLast.names.length} previously running desktop(s) to restart`);
@@ -287,6 +290,19 @@ async function runBootRestore() {
   }
 }
 function touchMachine(name) { const e = machineActivity.get(name) || { open: 0 }; e.lastActive = Date.now(); machineActivity.set(name, e); }
+
+// A panel stop parks a desktop's restart policy at "no", and a panel start
+// puts on-failure back. Docker's on-failure restarts any container that exited
+// non-zero (a slow app turns `docker stop` into exit 137, and with live-restore
+// a reboot leaves exit 255) at the next daemon start, which would bring back
+// desktops that users or the idle reaper had stopped. Legacy always and
+// unless-stopped policies are left alone.
+async function parkRestartPolicy(card) {
+  if (card?.restartPolicy === 'on-failure') await run(DOCKER, ['update', '--restart=no', card.name], TIMEOUTS.mutate);
+}
+async function armRestartPolicy(card) {
+  if (card?.restartPolicy === 'no') await run(DOCKER, ['update', '--restart=on-failure:3', card.name], TIMEOUTS.mutate);
+}
 function openMachineConn(name) { const e = machineActivity.get(name) || { open: 0 }; e.open = (e.open || 0) + 1; e.lastActive = Date.now(); machineActivity.set(name, e); }
 function closeMachineConn(name) { const e = machineActivity.get(name); if (e) { e.open = Math.max(0, (e.open || 0) - 1); e.lastActive = Date.now(); } }
 
@@ -328,7 +344,8 @@ async function maintenanceTickInner() {
     if (a.open > 0 || now - a.lastActive < idleMs || inFlight.has(card.name)) continue;
     console.error(`[VMP_IDLE_STOP] ${new Date(now).toISOString()} stopping idle ${card.name} (owner=${card.owner})`);
     inFlight.add(card.name);
-    run(DOCKER, ['stop', '-t', '10', card.name], TIMEOUTS.mutate)
+    parkRestartPolicy(card)
+      .then(() => run(DOCKER, ['stop', '-t', '10', card.name], TIMEOUTS.mutate))
       .then(() => { invalidateMachineCache(); dropBrowserSession(card.name); })
       .catch(() => {})
       .finally(() => inFlight.delete(card.name));
@@ -902,6 +919,8 @@ async function lifecycle(user, name, action) {
 
   inFlight.add(name);
   try {
+    if (action === 'stop') await parkRestartPolicy(card);
+    if (action === 'start') await armRestartPolicy(card);
     const r = await run(DOCKER, args, TIMEOUTS.mutate);
     invalidateMachineCache();
     if (action === 'stop' || action === 'restart') dropBrowserSession(name); // Selenium died with the container
@@ -1061,6 +1080,9 @@ async function archiveAndDeleteMachine(name, confirm, deletedBy, ref = null) {
   const { card } = resolved;
   const homeDir = homeDirFor(card.template);
   if (!homeDir) return { status: 400, body: { error: { code: 'ARCHIVE_UNSUPPORTED', message: 'This machine type has no home directory to keep.' } } };
+  // A copy of a withdrawn template could never be restored (no new machines
+  // of that kind), so say so now instead of keeping a copy that is a dead end.
+  if (TEMPLATES[card.template]?.withdrawn) return { status: 400, body: { error: { code: 'ARCHIVE_UNSUPPORTED', message: 'This machine type is withdrawn, so a kept copy could not be restored. Delete it without keeping a copy.' } } };
   if (inFlight.has(name)) return { status: 409, body: { error: { code: 'JOB_IN_FLIGHT', message: 'another action is in progress' } } };
 
   // The uncompressed writable layer bounds the copy from above. Refuse up front
@@ -1126,6 +1148,10 @@ async function restoreArchive(id, { name: wantName, owner: wantOwner } = {}) {
   const entry = archives.get(id);
   if (!entry || archives.isExpired(id)) return { status: 404, body: { error: { code: 'ARCHIVE_NOT_FOUND', message: 'That copy no longer exists (it may have expired).' } } };
   if (restoringArchives.has(id)) return { status: 409, body: { error: { code: 'JOB_IN_FLIGHT', message: 'This copy is already being restored.' } } };
+  // Refuse before the 202: the job's createMachine would fail on it anyway.
+  if (!TEMPLATES[entry.template] || TEMPLATES[entry.template].withdrawn) {
+    return { status: 409, body: { error: { code: 'ARCHIVE_TEMPLATE_WITHDRAWN', message: 'This copy is of a machine type that is no longer offered, so it cannot be restored.' } } };
+  }
 
   const owner = String(wantOwner || entry.owner || '').toLowerCase();
   const ownerUser = validateUsername(owner) ? users.get(owner) : null;
@@ -1298,8 +1324,11 @@ async function getDesktopTimezone(user, name) {
 }
 
 // Save a desktop's time zone and, by default, restart it so the session picks
-// it up (open apps close — callers confirm that with the user first).
-async function setDesktopTimezone(user, name, timeZone, { restart = true, via = null } = {}) {
+// it up (open apps close — callers confirm that with the user first). The whole
+// save + restart holds the machine's inFlight slot, like any lifecycle action.
+// A restart that fails after the save is reported as saved-not-applied (200,
+// restarted:false, restartError), not as a failed save.
+async function setDesktopTimezone(user, name, timeZone, { restart = true, via = null, req = null } = {}) {
   if (!validTimeZoneName(timeZone)) return { status: 400, body: { error: { code: 'VALIDATION', message: 'invalid time zone' } } };
   const resolved = await resolveMachine(user, name, 'use');
   if (resolved.error) return resolved.error;
@@ -1307,19 +1336,29 @@ async function setDesktopTimezone(user, name, timeZone, { restart = true, via = 
   if (!supportsDesktopTimezone(card.template)) return { status: 400, body: { error: { code: 'UNSUPPORTED', message: 'Only Linux desktops have a time zone setting.' } } };
   if (card.state !== 'running') return { status: 409, body: { error: { code: 'NOT_RUNNING', message: 'Start the desktop before changing its time zone.' } } };
   if (inFlight.has(name)) return { status: 409, body: { error: { code: 'JOB_IN_FLIGHT', message: 'another action is in progress' } } };
-  const home = homeDirFor(card.template);
-  const r = await run(DOCKER, ['exec', '-u', '1000',
-    '-e', `PRISM_TZ=${timeZone}`, '-e', `PRISM_HOME=${home}`, '-e', `PRISM_TZ_MARK=${TZ_HOOK_MARK}`, '-e', `PRISM_TZ_HOOK=${TZ_HOOK}`,
-    name, 'sh', '-c', TZ_WRITE_SCRIPT], TIMEOUTS.mutate);
-  if (!r.ok) {
-    if (r.code === 3) return { status: 400, body: { error: { code: 'UNKNOWN_TIME_ZONE', message: `This desktop does not know the time zone ${timeZone}.` } } };
-    return { status: 502, body: { error: { code: 'VM_ERROR', message: 'Could not save the desktop time zone.' } } };
+  inFlight.add(name);
+  let restarted = false;
+  let restartError = null;
+  try {
+    const home = homeDirFor(card.template);
+    const r = await run(DOCKER, ['exec', '-u', '1000',
+      '-e', `PRISM_TZ=${timeZone}`, '-e', `PRISM_HOME=${home}`, '-e', `PRISM_TZ_MARK=${TZ_HOOK_MARK}`, '-e', `PRISM_TZ_HOOK=${TZ_HOOK}`,
+      name, 'sh', '-c', TZ_WRITE_SCRIPT], TIMEOUTS.mutate);
+    if (!r.ok) {
+      if (r.code === 3) return { status: 400, body: { error: { code: 'UNKNOWN_TIME_ZONE', message: `This desktop does not know the time zone ${timeZone}.` } } };
+      return { status: 502, body: { error: { code: 'VM_ERROR', message: 'Could not save the desktop time zone.' } } };
+    }
+    if (restart) {
+      const rr = await run(DOCKER, ['restart', '-t', '10', name], TIMEOUTS.mutate);
+      invalidateMachineCache();
+      restarted = rr.ok;
+      if (!rr.ok) restartError = { code: 'DOCKER_CLI_ERROR', message: 'The time zone was saved, but the desktop could not be restarted. Restart it to apply the change.' };
+    }
+    recordAudit(req, user.username, 'machine.timezone', name, { timeZone, restart: !!restart, restarted, ...(restartError ? { restartError: restartError.code } : {}), ...(via ? { via } : {}) });
+    return { status: 200, body: { ok: true, name, timeZone, restarted, ...(restartError ? { restartError } : {}) } };
+  } finally {
+    inFlight.delete(name);
   }
-  recordAudit(null, user.username, 'machine.timezone', name, { timeZone, restart: !!restart, ...(via ? { via } : {}) });
-  if (!restart) return { status: 200, body: { ok: true, name, timeZone, restarted: false } };
-  const out = await lifecycle(user, name, 'restart');
-  if (out.status >= 300) return { status: out.status, body: { ...out.body, saved: true } };
-  return { status: 200, body: { ok: true, name, timeZone, restarted: true } };
 }
 
 // ---- File transfer (docker cp) ---------------------------------------------
@@ -2462,7 +2501,7 @@ async function handleExtApi(req, res, rawPath, method) {
       const body = await readJson(req);
       if (!body) return sendJson(res, 400, EXT_BAD_JSON);
       const actor = typeof body?.actor === 'string' ? body.actor.slice(0, 120) : null;
-      const out = await setDesktopTimezone(EXT_ACTOR, name, body?.timeZone, { restart: body?.restart !== false, via: actor ? `prism:${actor}` : 'prism' });
+      const out = await setDesktopTimezone(EXT_ACTOR, name, body?.timeZone, { restart: body?.restart !== false, via: actor ? `prism:${actor}` : 'prism', req });
       return sendJson(res, out.status, out.body);
     }
   }
@@ -2900,9 +2939,11 @@ async function handleProxy(req, res, setUser) {
   if (!card || !isPanelMachine(card) || !canUse(accessFor(auth.user, card))) return sendMachineHtml(req, res, 404, errorPage(404, 'Desktop not found', 'This desktop does not exist or is not assigned to you.', { back: false }));
   if (card.localOnly || !card.uiPort) return sendMachineHtml(req, res, 502, errorPage(502, 'Not available here', 'This machine can only be opened on the host Mac.', { back: false }));
   if (card.state !== 'running') return sendMachineHtml(req, res, 502, errorPage(502, 'Desktop is stopped', `“${parsed.name}” is not running. Press Reload in PRISM to start it again.`, { back: false }));
-  touchMachine(parsed.name); // idle-reaper activity signal
   const route = proxyRoute(card, parsed);
-  proxyHttp({ req, res, port: route.port, target: route.target, name: parsed.name, frameAncestors: panelFrameAncestors(req), ...backendProxyOpts(card) });
+  proxyHttp({
+    req, res, port: route.port, target: route.target, name: parsed.name, frameAncestors: panelFrameAncestors(req), ...backendProxyOpts(card),
+    onBackendResponse: () => touchMachine(parsed.name), // idle-reaper activity signal
+  });
 }
 
 // Kill any live proxied tunnels belonging to a user (revocation on disable/

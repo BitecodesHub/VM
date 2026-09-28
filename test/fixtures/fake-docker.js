@@ -116,6 +116,7 @@ if (['start', 'stop', 'restart', 'unpause', 'rm'].includes(cmd)) {
   const name = argv.filter((a) => !a.startsWith('-') && a !== String(parseInt(a, 10)))[argv.filter((a) => !a.startsWith('-') && a !== String(parseInt(a, 10))).length - 1];
   const c = w.containers[name];
   if (!c) fail(`Error: No such container: ${name}`);
+  if (cmd === 'restart' && process.env.FAKE_DOCKER_RESTART_FAIL) fail(`Error response from daemon: Cannot restart container ${name}: fake failure`);
   if (cmd === 'start' || cmd === 'restart' || cmd === 'unpause') {
     c.state = 'running'; c.exitCode = 0;
     // A (re)started session picks up the ~/.bashrc time zone hook, like vnc_startup.sh.
@@ -126,6 +127,18 @@ if (['start', 'stop', 'restart', 'unpause', 'rm'].includes(cmd)) {
     if (c.state === 'running' && !argv.includes('-f')) fail(`Error response from daemon: You cannot remove a running container ${name}. Stop the container before attempting removal or force remove`);
     delete w.containers[name];
   }
+  save(w);
+  process.stdout.write(name + '\n');
+  process.exit(0);
+}
+
+// update --restart=<policy> <name>: record the restart policy inspect reports.
+if (cmd === 'update') {
+  const name = argv[argv.length - 1];
+  const c = w.containers[name];
+  if (!c) fail(`Error response from daemon: No such container: ${name}`);
+  const pol = (argv.find((a) => a.startsWith('--restart=')) || '').slice('--restart='.length);
+  if (pol) { c.restart = pol.split(':')[0]; c.updates = [...(c.updates || []), pol]; }
   save(w);
   process.stdout.write(name + '\n');
   process.exit(0);

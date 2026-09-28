@@ -16,7 +16,10 @@ export async function spawnPanel(opts = {}) {
   const statePath = path.join(dataDir, 'docker-world.json');
   fs.writeFileSync(statePath, JSON.stringify(opts.world || { nextId: 1, containers: {} }));
   if (opts.config) fs.writeFileSync(path.join(dataDir, 'config.json'), JSON.stringify(opts.config));
-  for (const [f, content] of Object.entries(opts.files || {})) fs.writeFileSync(path.join(dataDir, f), typeof content === 'string' ? content : JSON.stringify(content));
+  for (const [f, content] of Object.entries(opts.files || {})) {
+    fs.mkdirSync(path.dirname(path.join(dataDir, f)), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(dataDir, f), typeof content === 'string' ? content : JSON.stringify(content));
+  }
 
   const env = {
     ...process.env,
