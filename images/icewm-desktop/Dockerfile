@@ -12,6 +12,14 @@ ENV DEBIAN_FRONTEND=noninteractive
 # failed hardware/zink init.
 ENV LIBGL_ALWAYS_SOFTWARE=1
 
+# Patch the base image's own packages. kasmweb/core-ubuntu-noble:1.17.0 was last
+# pushed 2025-04, so `--pull` alone changes nothing; without this every rebuild
+# keeps its 2025 userland (libc, OpenSSL, X libraries). KasmVNC itself is a
+# local .deb with no apt repo, so an upgrade cannot replace it.
+RUN apt-get update \
+  && apt-get -y -o Dpkg::Options::=--force-confold upgrade \
+  && rm -rf /var/lib/apt/lists/*
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
       icewm xterm \
       pulseaudio-utils alsa-utils pavucontrol \
