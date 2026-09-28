@@ -725,3 +725,37 @@ test('readiness: a TLS (KasmVNC) backend is probed over HTTPS and reports ready'
     });
   } finally { backend.close(); }
 });
+
+test('proxy: static viewer assets get image-scoped validators; a match is answered 304 without the backend', async () => {
+  const backend = await startBackend();
+  try {
+    await withPanel({ world: seedMachine('alice', backend.port) }, async (panel) => {
+      const admin = await setupAdmin(panel);
+      await panel.req('POST', '/api/users', { cookie: admin, body: { username: 'alice', password: PW, role: 'user' } });
+      const alice = await activate(panel, 'alice', PW);
+
+      const js = await panel.req('GET', '/m/desktop-1/main.bundle.js', { cookie: alice, machine: true });
+      assert.equal(js.status, 200);
+      assert.equal(js.headers.get('cache-control'), 'private, no-cache');
+      const etag = js.headers.get('etag');
+      assert.match(etag || '', /^W\/"[0-9a-z]{1,12}-[0-9a-f]{16}"$/);
+      const chunk = await panel.req('GET', '/m/desktop-1/assets/webutil-DUkojxeL.js', { cookie: alice, machine: true });
+      assert.match(chunk.headers.get('cache-control') || '', /immutable/);
+      const html = await panel.req('GET', '/m/desktop-1/vnc.html', { cookie: alice, machine: true });
+      assert.equal(html.headers.get('cache-control'), 'no-store', 'the viewer page itself is never cached');
+      assert.equal(html.headers.get('etag'), null);
+
+      backend.state.lastHeaders = null;
+      for (const inm of [etag, etag.replace(/"$/, '-zstd"'), `"other", ${etag}`]) {
+        const again = await panel.req('GET', '/m/desktop-1/main.bundle.js', { cookie: alice, machine: true, headers: { 'If-None-Match': inm } });
+        assert.equal(again.status, 304, inm);
+        assert.equal(again.headers.get('etag'), etag);
+      }
+      assert.equal(backend.state.lastHeaders, null, 'the desktop was not asked');
+      const stale = await panel.req('GET', '/m/desktop-1/main.bundle.js', { cookie: alice, machine: true, headers: { 'If-None-Match': 'W/"nope"' } });
+      assert.equal(stale.status, 200, 'a different tag gets the file');
+      // Still authenticated: no cookie, no 304.
+      assert.notEqual((await panel.req('GET', '/m/desktop-1/main.bundle.js', { machine: true, headers: { 'If-None-Match': etag } })).status, 304);
+    });
+  } finally { backend.close(); }
+});

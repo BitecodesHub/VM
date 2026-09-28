@@ -13,6 +13,7 @@ import {
   validateName, validateUsername, firstFreePort, nextName, usedHostPorts,
   mapContainerToCard, buildRunArgs, parseColimaList, listTemplates, availableTemplates,
   TZ_HOOK, TZ_HOOK_MARK, TZ_READ_SCRIPT, TZ_WRITE_SCRIPT, validTimeZoneName, parseZoneTab, supportsDesktopTimezone,
+  templateDefaultResources, resourceBounds, validateResources,
   filterMachinesForUser, quotaUsage, pickLanAddress, USER_RUNNING_LIMIT, isPanelMachine,
   machineAccess, canUse, canDelete, canManageAccess, quotaExceeded, QUOTA_STATES,
   backendAuthFor, networkNameFor,
@@ -34,7 +35,7 @@ import { AuditLog } from './lib/audit.js';
 import { sweepStale } from './lib/tmpsweep.js';
 import { validatePassword, LoginLimiter, RateLimiter } from './lib/auth.js';
 import {
-  parseProxyPath, isAllowedHost, isAllowedOrigin, errorPage, proxyHttp, proxyUpgrade,
+  parseProxyPath, isAllowedHost, isAllowedOrigin, errorPage, proxyHttp, proxyUpgrade, staticAssetPolicy, etagMatches,
 } from './lib/proxy.js';
 import {
   parseDockerStats, parseSystemDf, parsePsSizes, shapeMachineStats, buildResourcesPayload,
@@ -779,7 +780,18 @@ async function createMachine(user, template, opts = {}) {
   }
   // Resources are shared by default; admins may opt this machine into hard caps
   // (per-create wins over the global config.capResources default).
-  const cap = isAdmin && typeof opts.cap === 'boolean' ? opts.cap : !!config.capResources;
+  let cap = isAdmin && typeof opts.cap === 'boolean' ? opts.cap : !!config.capResources;
+  // Explicit limits (admins only) imply a capped machine; otherwise a capped
+  // machine gets this template's defaults (config.resourceDefaults or the
+  // template's own values).
+  let resources = null;
+  if (isAdmin && opts.resources != null) {
+    const v = validateResources(opts.resources, hostResourceBounds());
+    if (!v.ok) return { status: 400, body: { error: { code: 'VALIDATION', message: v.error } } };
+    resources = v.value;
+    cap = true;
+  }
+  if (cap && !resources) resources = defaultResourcesFor(template);
 
   let inspects;
   try { inspects = await inspectAll(); }
@@ -841,7 +853,7 @@ async function createMachine(user, template, opts = {}) {
         if (!netOk) console.error(`[VMP] ${name}: per-machine network create failed — falling back to the default bridge (containers will NOT be isolated from each other): ${tail(netRes.stderr)}`);
         const args = buildRunArgs({
           template, name, ports, createdAt: new Date().toISOString(), owner: username,
-          webdriverBind, cap, hostWebcam: webcam, authSecret: SECRET,
+          webdriverBind, cap, resources, hostWebcam: webcam, authSecret: SECRET,
           network: netOk ? network : null,
         });
         const r = await run(DOCKER, args, TIMEOUTS.mutate);
@@ -1118,6 +1130,7 @@ async function archiveAndDeleteMachine(name, confirm, deletedBy, ref = null) {
       const entry = await archives.add({
         id, machine: name, displayName: machineMeta.displayName(name), template: card.template,
         owner: card.owner, sharedWith: shares.listFor(name), homeDir, bytes, deletedBy, ref,
+        limits: card.limits?.cpus && card.limits?.memoryMiB ? card.limits : null,
       });
       if (!(await rmContainer(name))) {
         await archives.remove(id).catch(() => {});
@@ -1174,7 +1187,9 @@ async function restoreArchive(id, { name: wantName, owner: wantOwner } = {}) {
   const job = startExtJob('restore', name, async () => {
     try {
       const viewers = entry.sharedWith.filter((v) => v !== owner && users.get(v));
-      const out = await createMachine({ username: owner, role: 'admin' }, entry.template, { name, viewers });
+      // Bring the desktop back with the limits it had, when they still fit this host.
+      const kept = entry.limits && validateResources(entry.limits, hostResourceBounds()).ok ? entry.limits : null;
+      const out = await createMachine({ username: owner, role: 'admin' }, entry.template, { name, viewers, ...(kept ? { resources: kept } : {}) });
       if (out.status >= 300) throw new JobError(out.body?.error?.code || 'CREATE_FAILED', out.body?.error?.message || 'The desktop could not be created.');
       inFlight.add(name);
       try {
@@ -1246,8 +1261,10 @@ function extSettingsBody() {
       maxRunningMachines: config.maxRunningMachines,
       idleStopMinutes: config.idleStopMinutes,
       capResources: !!config.capResources,
+      resourceDefaults: resourceDefaultsBody(),
     },
     readOnly: {
+      resourceBounds: hostResourceBounds(),
       sessionIdleHours: config.sessionIdleHours,
       sessionMaxDays: config.sessionMaxDays,
       perUserRunningLimit: USER_RUNNING_LIMIT,
@@ -1359,6 +1376,67 @@ async function setDesktopTimezone(user, name, timeZone, { restart = true, via = 
   } finally {
     inFlight.delete(name);
   }
+}
+
+// ---- Desktop resources (lib/core.js resourceBounds) ------------------------
+function hostResourceBounds() {
+  const h = hostSnapshot();
+  return resourceBounds(h.cpus, Math.floor(h.memTotalBytes / 1048576));
+}
+// The limits a new capped desktop of `template` gets: the admin's saved default
+// when it still fits this host, else the template's own values, clamped.
+function defaultResourcesFor(template) {
+  const own = templateDefaultResources(template);
+  if (!own) return null;
+  const bounds = hostResourceBounds();
+  const saved = config.resourceDefaults?.[template];
+  if (saved) { const v = validateResources(saved, bounds); if (v.ok) return v.value; }
+  return { cpus: Math.min(own.cpus, bounds.max.cpus), memoryMiB: Math.min(own.memoryMiB, bounds.max.memoryMiB) };
+}
+function resourceDefaultsBody() {
+  return Object.fromEntries(availableTemplates().map((t) => [t.id, defaultResourcesFor(t.id)]));
+}
+const MiB = 1048576;
+const fmtGiB = (mib) => `${Math.round((mib / 1024) * 10) / 10} GB`;
+
+// Change a desktop's vCPU and memory limits in place (docker update: a running
+// desktop keeps running). Refuses to squeeze memory below what the desktop is
+// using now, which would make the kernel kill its apps.
+async function updateMachineResources(user, name, body, { req = null, via = null } = {}) {
+  const resolved = await resolveMachine(user, name, 'use');
+  if (resolved.error) return resolved.error;
+  const { card, cards } = resolved;
+  const v = validateResources(body, hostResourceBounds());
+  if (!v.ok) return { status: 400, body: { error: { code: 'VALIDATION', message: v.error } } };
+  const { cpus, memoryMiB } = v.value;
+  if (inFlight.has(name)) return { status: 409, body: { error: { code: 'JOB_IN_FLIGHT', message: 'another action is in progress' } } };
+  if (card.state === 'running' && card.limits?.memoryMiB !== memoryMiB) {
+    let used = null;
+    try { used = (await statsCache.get()).value?.data?.byName?.get(name)?.memUsedBytes ?? null; } catch { used = null; }
+    if (used != null && memoryMiB * MiB < used + 256 * MiB) {
+      const need = Math.ceil((used / MiB + 256) / 256) * 256;
+      return { status: 409, body: { error: { code: 'MEMORY_IN_USE', message: `This desktop is using ${fmtGiB(used / MiB)} right now. Choose at least ${fmtGiB(need)}, or stop the desktop first.` }, minMemoryMiB: need } };
+    }
+  }
+  inFlight.add(name);
+  let r;
+  try {
+    r = await run(DOCKER, ['update', '--cpus', String(cpus), '--memory', `${memoryMiB}m`, '--memory-swap', `${memoryMiB}m`, name], TIMEOUTS.mutate);
+    invalidateMachineCache();
+  } finally {
+    inFlight.delete(name);
+  }
+  if (!r.ok) return { status: 500, body: { error: { code: 'DOCKER_CLI_ERROR', message: 'Could not change this desktop\'s resources. Please try again.', ...(user.role === 'admin' ? { stderr: tail(r.stderr) } : {}) } } };
+  recordAudit(req, user.username, 'machine.resources', name, { before: card.limits, after: { cpus, memoryMiB }, ...(via ? { via } : {}) });
+  // Memory limits are promises, not reservations: warn when the running
+  // desktops' limits add up to more than the host can actually give.
+  const hostMiB = Math.floor(os.totalmem() / MiB) - 1024;
+  const committed = cards.filter((c) => isPanelMachine(c) && c.state === 'running' && c.name !== name).reduce((a, c) => a + (c.limits?.memoryMiB || 0), 0)
+    + (card.state === 'running' ? memoryMiB : 0);
+  const warning = committed > hostMiB
+    ? `Running desktops may now use up to ${fmtGiB(committed)} of memory, more than this host can give them (${fmtGiB(hostMiB)}). If they all fill up, apps will slow down or close.`
+    : null;
+  return { status: 200, body: { ok: true, name, limits: { cpus, memoryMiB }, ...(warning ? { warning } : {}) } };
 }
 
 // ---- File transfer (docker cp) ---------------------------------------------
@@ -2273,6 +2351,7 @@ async function handleExtApi(req, res, rawPath, method) {
       sharedWith: shares.listFor(c.name),
       createdAt: c.createdAt || null,
       screenPath: `/m/${c.name}/`,
+      limits: c.limits || { cpus: null, memoryMiB: null }, // null = no limit (uncapped)
     }));
     return sendJson(res, 200, { machines, machineOrigin: machineOriginFor(req) });
   }
@@ -2383,8 +2462,8 @@ async function handleExtApi(req, res, rawPath, method) {
     if (!validateUsername(owner) || !users.get(owner)) return sendJson(res, 400, { error: { code: 'VALIDATION', message: 'unknown owner user' } });
     // Act as an admin-capable actor OWNED by the target (custom name/viewers OK,
     // no per-user quota) — provisioning is an administrative operation.
-    const out = await createMachine({ username: owner, role: 'admin' }, body.template, { name: body.name, viewers: body.viewers, cap: body.cap });
-    if (out.status < 300) { invalidateMachineCache(); recordAudit(req, 'prism', 'machine.create', out.body?.name || body.name || null, { template: body.template, owner, via: 'ext' }); }
+    const out = await createMachine({ username: owner, role: 'admin' }, body.template, { name: body.name, viewers: body.viewers, cap: body.cap, resources: body.resources });
+    if (out.status < 300) { invalidateMachineCache(); recordAudit(req, 'prism', 'machine.create', out.body?.name || body.name || null, { template: body.template, owner, via: 'ext', ...(body.resources ? { resources: body.resources } : {}) }); }
     return sendJson(res, out.status, out.body);
   }
 
@@ -2427,7 +2506,7 @@ async function handleExtApi(req, res, rawPath, method) {
   // has to leave PRISM. All calls act as an admin; PRISM gates them on manage_vms.
   const url = new URL(req.url, `http://${LOOPBACK}`);
 
-  if (sub === '/templates' && method === 'GET') return sendJson(res, 200, { templates: availableTemplates() });
+  if (sub === '/templates' && method === 'GET') return sendJson(res, 200, { templates: availableTemplates().map((t) => ({ ...t, defaults: defaultResourcesFor(t.id) })), bounds: hostResourceBounds() });
 
   // Delete. Body { confirm: <name>, archive?: boolean (default true), actor? }.
   // With archive (the default) this returns 202 + a job; poll /jobs/<id>.
@@ -2492,6 +2571,13 @@ async function handleExtApi(req, res, rawPath, method) {
   }
   if ((m = sub.match(/^\/machines\/([^/]+)\/ready$/)) && method === 'GET') {
     const out = await readiness(EXT_ACTOR, decodeURIComponent(m[1]));
+    return sendJson(res, out.status, out.body);
+  }
+  if ((m = sub.match(/^\/machines\/([^/]+)\/resources$/)) && method === 'PATCH') {
+    const body = await readJson(req);
+    if (!body) return sendJson(res, 400, EXT_BAD_JSON);
+    const actor = typeof body.actor === 'string' ? body.actor.slice(0, 120) : null;
+    const out = await updateMachineResources(EXT_ACTOR, decodeURIComponent(m[1]), { cpus: body.cpus, memoryMiB: body.memoryMiB }, { req, via: actor ? `prism:${actor}` : 'prism' });
     return sendJson(res, out.status, out.body);
   }
   if ((m = sub.match(/^\/machines\/([^/]+)\/timezone$/))) {
@@ -2574,6 +2660,17 @@ async function handleExtApi(req, res, rawPath, method) {
       if (!body) return sendJson(res, 400, EXT_BAD_JSON);
       const v = validateExtSettingsPatch(body);
       if (!v.ok) return sendJson(res, 400, { error: { code: 'VALIDATION', message: v.error } });
+      if (v.patch.resourceDefaults) {
+        const bounds = hostResourceBounds();
+        const merged = { ...(config.resourceDefaults || {}) };
+        for (const [tid, r] of Object.entries(v.patch.resourceDefaults)) {
+          if (!TEMPLATES[tid] || TEMPLATES[tid].withdrawn) return sendJson(res, 400, { error: { code: 'VALIDATION', message: `unknown template "${tid}"` } });
+          const rv = validateResources(r, bounds);
+          if (!rv.ok) return sendJson(res, 400, { error: { code: 'VALIDATION', message: `${tid}: ${rv.error}` } });
+          merged[tid] = rv.value;
+        }
+        v.patch.resourceDefaults = merged;
+      }
       try { await persistConfigPatch(DATA_DIR, v.patch, { atomicWriteJson }); }
       catch (e) { return sendJson(res, 500, { error: { code: 'CONFIG_WRITE_FAILED', message: String(e?.message || e).slice(0, 200) } }); }
       const before = Object.fromEntries(Object.keys(v.patch).map((k) => [k, config[k]]));
@@ -2940,9 +3037,19 @@ async function handleProxy(req, res, setUser) {
   if (card.localOnly || !card.uiPort) return sendMachineHtml(req, res, 502, errorPage(502, 'Not available here', 'This machine can only be opened on the host Mac.', { back: false }));
   if (card.state !== 'running') return sendMachineHtml(req, res, 502, errorPage(502, 'Desktop is stopped', `“${parsed.name}” is not running. Press Reload in PRISM to start it again.`, { back: false }));
   const route = proxyRoute(card, parsed);
+  // Static viewer assets: answer a matching revalidation here (304, the backend
+  // is not asked), and let the browser keep them; see staticAssetPolicy.
+  const asset = (req.method === 'GET' || req.method === 'HEAD') && route.port === card.uiPort
+    ? staticAssetPolicy(route.target, card.imageId, (x) => crypto.createHash('sha1').update(x).digest('hex'))
+    : null;
+  if (asset && etagMatches(req.headers['if-none-match'], asset.etag)) {
+    res.writeHead(304, { ETag: asset.etag, 'Cache-Control': asset.cacheControl, 'X-Content-Type-Options': 'nosniff' });
+    return res.end();
+  }
   proxyHttp({
     req, res, port: route.port, target: route.target, name: parsed.name, frameAncestors: panelFrameAncestors(req), ...backendProxyOpts(card),
     onBackendResponse: () => touchMachine(parsed.name), // idle-reaper activity signal
+    cacheHeaders: asset ? { 'Cache-Control': asset.cacheControl, ETag: asset.etag } : null,
   });
 }
 

@@ -19,6 +19,8 @@ function load() {
 }
 function save(w) { fs.writeFileSync(STATE, JSON.stringify(w, null, 2)); }
 function fail(msg) { process.stderr.write(msg + '\n'); process.exit(1); }
+// "2048m" / "2g" / plain bytes -> bytes (docker --memory syntax).
+function memBytes(v) { const m = String(v).match(/^(\d+(?:\.\d+)?)([kmg])?$/i); if (!m) return 0; const n = Number(m[1]); const u = (m[2] || '').toLowerCase(); return Math.round(n * (u === 'g' ? 1073741824 : u === 'm' ? 1048576 : u === 'k' ? 1024 : 1)); }
 
 const w = load();
 const byId = (id) => Object.entries(w.containers).find(([, c]) => c.id === id);
@@ -44,7 +46,8 @@ function inspectObj(name, c) {
     Name: '/' + name,
     Config: { Image: c.image, Labels: c.labels || {} },
     State: { Status: c.state, StartedAt: c.startedAt || '2026-07-10T00:00:00Z', ExitCode: c.exitCode ?? 0, OOMKilled: !!c.oomKilled },
-    HostConfig: { PortBindings: pb, Memory: c.memoryBytes || 0, RestartPolicy: { Name: c.restart || 'on-failure', MaximumRetryCount: c.restart ? 0 : 3 } },
+    Image: `sha256:${c.imageId || `fake${String(c.image || '').replace(/[^a-z0-9]/gi, '')}`}`,
+    HostConfig: { PortBindings: pb, Memory: c.memoryBytes || 0, NanoCpus: c.nanoCpus || 0, RestartPolicy: { Name: c.restart || 'on-failure', MaximumRetryCount: c.restart ? 0 : 3 } },
     NetworkSettings: { Ports: pb },
   };
 }
@@ -80,7 +83,7 @@ if (cmd === 'inspect') {
 }
 
 if (cmd === 'run') {
-  let name = null, image = null, memory = 0, device = null; const labels = {}; const ports = {};
+  let name = null, image = null, memory = 0, nanoCpus = 0, device = null; const labels = {}; const ports = {};
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--name') name = argv[++i];
@@ -88,7 +91,8 @@ if (cmd === 'run') {
     else if (a === '-p') { const m = argv[++i].match(/^[^:]+:(\d+):(\d+)$/); if (m) ports[m[2]] = m[1]; }
     else if (a === '--device') device = argv[++i];
     else if (a === '-e') i++;
-    else if (a === '--memory') memory = parseInt(argv[++i], 10) * (/m$/.test(argv[i]) ? 1 : 1);
+    else if (a === '--memory') memory = memBytes(argv[++i]);
+    else if (a === '--cpus') nanoCpus = Math.round(Number(argv[++i]) * 1e9);
     else if (a === '--memory-swap' || a === '--shm-size') i++;
     else if (a === '-d' || a === '--restart') { if (a === '--restart') i++; }
     else if (!a.startsWith('-')) image = a;
@@ -106,7 +110,7 @@ if (cmd === 'run') {
   }
   if (w.containers[name]) fail(`docker: Error response from daemon: Conflict. The container name "/${name}" is already in use.`);
   const id = 'fake' + String(w.nextId++).padStart(9, '0');
-  w.containers[name] = { id, image, labels, ports, state: 'running', exitCode: 0, startedAt: new Date(0).toISOString(), memoryBytes: memory };
+  w.containers[name] = { id, image, labels, ports, state: 'running', exitCode: 0, startedAt: new Date(0).toISOString(), memoryBytes: memory, nanoCpus };
   save(w);
   process.stdout.write(id + '\n');
   process.exit(0);
@@ -139,6 +143,10 @@ if (cmd === 'update') {
   if (!c) fail(`Error response from daemon: No such container: ${name}`);
   const pol = (argv.find((a) => a.startsWith('--restart=')) || '').slice('--restart='.length);
   if (pol) { c.restart = pol.split(':')[0]; c.updates = [...(c.updates || []), pol]; }
+  const val = (flag) => { const i = argv.indexOf(flag); return i >= 0 ? argv[i + 1] : null; };
+  if (process.env.FAKE_DOCKER_UPDATE_FAIL && val('--memory')) fail('Error response from daemon: fake update failure');
+  if (val('--cpus')) c.nanoCpus = Math.round(Number(val('--cpus')) * 1e9);
+  if (val('--memory')) c.memoryBytes = memBytes(val('--memory'));
   save(w);
   process.stdout.write(name + '\n');
   process.exit(0);
