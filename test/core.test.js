@@ -481,3 +481,11 @@ test('parseColimaList handles stopped and empty', () => {
 test('RESERVED_PORTS protects the panel and infra ports', () => {
   for (const p of [5050, 6080, 7900, 4444, 9000, 9443]) assert.ok(RESERVED_PORTS.has(p));
 });
+
+test('desktop viewers keep clipboard and the control bar when framed', async () => {
+  const { TEMPLATES, DESKTOP_UI_PATH } = await import('../lib/core.js');
+  assert.match(DESKTOP_UI_PATH, /[?&]show_control_bar=true(&|$)/);
+  assert.equal(TEMPLATES['linux-desktop'].ui.path, DESKTOP_UI_PATH);
+  assert.equal(TEMPLATES['icewm-desktop'].ui.path, DESKTOP_UI_PATH);
+  assert.match(DESKTOP_UI_PATH, /resize=remote/);
+});

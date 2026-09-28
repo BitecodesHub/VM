@@ -17,7 +17,8 @@ import {
   backendAuthFor, networkNameFor,
 } from './lib/core.js';
 import { loadConfig, validateExtSettingsPatch, persistConfigPatch } from './lib/config.js';
-import { ensureDataDir, ensureSecret, acquireInstanceLock, atomicWriteJson } from './lib/store.js';
+import { ensureDataDir, ensureSecret, acquireInstanceLock, atomicWriteJson, readBootId } from './lib/store.js';
+import { LAST_RUNNING_FILE, readLastRunning, lastRunningRecord, planBootRestore } from './lib/bootRestore.js';
 import { ArchiveStore, validArchiveId, validArchiveRef, ARCHIVE_RETENTION_DAYS } from './lib/archives.js';
 import { UserStore } from './lib/users.js';
 import { SessionStore } from './lib/sessions.js';
@@ -235,6 +236,55 @@ const hostWebcam = probeHostWebcam();
 // reaper stops desktops with no open screen for config.idleStopMinutes. Seeded to
 // "now" on first sight so a panel restart never mass-reaps.
 const machineActivity = new Map(); // name -> { lastActive, open }
+
+// ---- Boot restore (lib/bootRestore.js) --------------------------------------
+// Read the previous boot's record BEFORE the first tick overwrites it; the file
+// is not rewritten until the restore has run, so a crash mid-restore keeps it.
+const BOOT_ID = process.env.VMP_TEST_BOOT_ID || readBootId(); // override is for the integration tests only
+const bootRestoreLast = readLastRunning(DATA_DIR);
+let bootRestoreDone = false;
+let lastRunningJson = null;
+function recordLastRunning(byName) {
+  if (!bootRestoreDone) return;
+  const names = [...byName.values()]
+    .filter((c) => isPanelMachine(c) && c.state === 'running')
+    .map((c) => c.name)
+    .sort((a, b) => (machineActivity.get(b)?.lastActive || 0) - (machineActivity.get(a)?.lastActive || 0));
+  const json = JSON.stringify({ bootId: BOOT_ID, names });
+  if (json === lastRunningJson) return;
+  atomicWriteJson(path.join(DATA_DIR, LAST_RUNNING_FILE), lastRunningRecord(BOOT_ID, names))
+    .then(() => { lastRunningJson = json; })
+    .catch((e) => console.error(`[VMP_BOOT_RESTORE] could not record running machines: ${e.message}`));
+}
+const BOOT_ACTOR = { username: 'boot-restore', role: 'admin' };
+async function runBootRestore() {
+  try {
+    // Docker may still be coming up after a reboot: wait for a fresh snapshot.
+    let snap = null;
+    for (let i = 0; i < 20 && !shuttingDown; i++) {
+      try { snap = await cardsCached(); } catch { snap = null; }
+      if (snap && !snap.stale) break;
+      snap = null;
+      await new Promise((r) => setTimeout(r, 15_000));
+    }
+    if (!snap) { console.error('[VMP_BOOT_RESTORE] docker never answered; nothing restored'); return; }
+    const plan = planBootRestore(bootRestoreLast, BOOT_ID, snap.byName, { maxRunning: config.maxRunningMachines, isPanelMachine });
+    if (bootRestoreLast?.bootId && bootRestoreLast.bootId !== BOOT_ID) {
+      console.log(`[VMP_BOOT_RESTORE] host rebooted; ${plan.length} of ${bootRestoreLast.names.length} previously running desktop(s) to restart`);
+    }
+    for (const name of plan) {
+      if (shuttingDown) break;
+      const out = await lifecycle(BOOT_ACTOR, name, 'start');
+      const ok = out.status < 300;
+      console.log(`[VMP_BOOT_RESTORE] start ${name}: ${ok ? 'ok' : `${out.status} ${out.body?.error?.code || ''}`}`);
+      recordAudit(null, BOOT_ACTOR.username, 'machine.start', name, { via: 'boot-restore', ok });
+    }
+  } catch (e) {
+    console.error(`[VMP_BOOT_RESTORE] ${e.message}`);
+  } finally {
+    bootRestoreDone = true;
+  }
+}
 function touchMachine(name) { const e = machineActivity.get(name) || { open: 0 }; e.lastActive = Date.now(); machineActivity.set(name, e); }
 function openMachineConn(name) { const e = machineActivity.get(name) || { open: 0 }; e.open = (e.open || 0) + 1; e.lastActive = Date.now(); machineActivity.set(name, e); }
 function closeMachineConn(name) { const e = machineActivity.get(name); if (e) { e.open = Math.max(0, (e.open || 0) - 1); e.lastActive = Date.now(); } }
@@ -282,6 +332,7 @@ async function maintenanceTickInner() {
       .catch(() => {})
       .finally(() => inFlight.delete(card.name));
   }
+  recordLastRunning(byName);
   // Sample aggregate metrics + evaluate alerts (best-effort).
   try {
     const r = await getResources({ role: 'admin', username: '__sampler__' });
@@ -1620,6 +1671,19 @@ function sendText(res, status, text, extraHeaders = {}) {
   res.writeHead(status, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': buf.length, ...SEC_HEADERS, ...extraHeaders });
   res.end(buf);
 }
+// HTML served on the MACHINE origin (SSO redeem errors, screen errors) is shown
+// inside PRISM's desktop iframe, so it must be framable by exactly the screens'
+// allow-list. With X-Frame-Options SAMEORIGIN every one of these pages rendered
+// as a blank or "refused to connect" frame instead of its plain message.
+function sendMachineHtml(req, res, status, html) {
+  const buf = Buffer.from(html);
+  res.writeHead(status, {
+    'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': buf.length,
+    'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': `frame-ancestors ${panelFrameAncestors(req)}`,
+  });
+  res.end(buf);
+}
 function sendHtml(res, status, html, extraHeaders = {}) {
   const buf = Buffer.from(html);
   res.writeHead(status, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', 'Content-Length': buf.length, ...SEC_HEADERS, ...extraHeaders });
@@ -2416,14 +2480,14 @@ async function handleExtApi(req, res, rawPath, method) {
 // session cookie, then redirect into the machine screen. Enables the fully
 // embedded desktop inside PRISM without the user logging into the panel.
 async function handleSsoRedeem(req, res, setUser) {
-  if (!config.panelApiToken) return sendHtml(res, 404, errorPage(404, 'Not found', 'Single sign-on is not enabled on this panel.'));
+  if (!config.panelApiToken) return sendMachineHtml(req, res, 404, errorPage(404, 'Not found', 'Single sign-on is not enabled on this panel.', { back: false }));
   const url = new URL(req.url, `http://${req.headers.host || LOOPBACK}`);
   const now = Date.now();
   const payload = verifySsoToken(SECRET, url.searchParams.get('t') || '', { now });
-  if (!payload) return sendHtml(res, 401, errorPage(401, 'Sign-in link expired', 'This link is invalid or has expired. Return to PRISM and open the desktop again.'));
-  if (!ssoGuard.claim(payload.jti, payload.exp)) return sendHtml(res, 401, errorPage(401, 'Link already used', 'This sign-in link was already used. Return to PRISM and open the desktop again.'));
+  if (!payload) return sendMachineHtml(req, res, 401, errorPage(401, 'Sign-in link expired', 'This link is invalid or has expired. Press Reload in PRISM to open the desktop again.', { back: false }));
+  if (!ssoGuard.claim(payload.jti, payload.exp)) return sendMachineHtml(req, res, 401, errorPage(401, 'Link already used', 'This sign-in link was already used. Press Reload in PRISM to open the desktop again.', { back: false }));
   const user = users.get(payload.username);
-  if (!user || user.disabled) return sendHtml(res, 403, errorPage(403, 'No access', 'This account cannot sign in.'));
+  if (!user || user.disabled) return sendMachineHtml(req, res, 403, errorPage(403, 'No access', 'Your desktop access is not active. Contact your administrator.', { back: false }));
   // Scope the session to the machine the link was minted for (when it named one),
   // so this cookie cannot be replayed against the panel API or another desktop.
   const { setCookie } = await sessions.create(payload.username, {
@@ -2738,21 +2802,22 @@ async function handleProxy(req, res, setUser) {
   const auth = authenticateRequest(req);
   if (!auth) {
     // Navigations → send to login; subresources → 401.
+    // A navigation gets a framable page that says what to do: the old redirect to
+    // "/" landed on the machine origin's 404, shown blank inside PRISM.
     if ((req.headers.accept || '').includes('text/html')) {
-      res.writeHead(302, { Location: '/', 'Cache-Control': 'no-store' });
-      return res.end();
+      return sendMachineHtml(req, res, 401, errorPage(401, 'Desktop session ended', 'Press Reload in PRISM to open the desktop again.', { back: false }));
     }
     return sendText(res, 401, 'Unauthenticated');
   }
-  if (auth.fullUser.mustChangePassword) return sendHtml(res, 403, errorPage(403, 'Password change required', 'Set a new password in PRISM Virtual Desktop before opening machines.'));
+  if (auth.fullUser.mustChangePassword) return sendMachineHtml(req, res, 403, errorPage(403, 'Password change required', 'Set a new password in PRISM Virtual Desktop before opening machines.', { back: false }));
   setUser(auth.user.username);
 
   const parsed = parseProxyPath(req.url);
-  if (!parsed) return sendHtml(res, 404, errorPage(404, 'Not found', 'That machine path is not valid.'));
+  if (!parsed) return sendMachineHtml(req, res, 404, errorPage(404, 'Not found', 'That machine path is not valid.', { back: false }));
   // Machine-scoped embed session: only its own desktop. Same 404 as an unknown
   // machine, so the response is not an existence oracle for other machines.
   if (auth.session?.machine && auth.session.machine !== parsed.name) {
-    return sendHtml(res, 404, errorPage(404, 'Not found', 'That machine path is not valid.'));
+    return sendMachineHtml(req, res, 404, errorPage(404, 'Not found', 'That machine path is not valid.', { back: false }));
   }
   if (parsed.rest === null) {
     res.writeHead(302, { Location: `/m/${parsed.name}/${parsed.query}`, 'Cache-Control': 'no-store' });
@@ -2761,9 +2826,9 @@ async function handleProxy(req, res, setUser) {
   let card;
   try { card = await resolveMachineCached(parsed.name); }
   catch { card = null; }
-  if (!card || !isPanelMachine(card) || !canUse(accessFor(auth.user, card))) return sendHtml(res, 404, errorPage(404, 'Machine not found', 'This machine does not exist or is not yours.'));
-  if (card.localOnly || !card.uiPort) return sendHtml(res, 502, errorPage(502, 'Not available here', 'This machine can only be opened on the host Mac.'));
-  if (card.state !== 'running') return sendHtml(res, 502, errorPage(502, 'Machine is not running', `“${parsed.name}” is stopped. Start it from PRISM Virtual Desktop, then try again.`));
+  if (!card || !isPanelMachine(card) || !canUse(accessFor(auth.user, card))) return sendMachineHtml(req, res, 404, errorPage(404, 'Desktop not found', 'This desktop does not exist or is not assigned to you.', { back: false }));
+  if (card.localOnly || !card.uiPort) return sendMachineHtml(req, res, 502, errorPage(502, 'Not available here', 'This machine can only be opened on the host Mac.', { back: false }));
+  if (card.state !== 'running') return sendMachineHtml(req, res, 502, errorPage(502, 'Desktop is stopped', `“${parsed.name}” is not running. Press Reload in PRISM to start it again.`, { back: false }));
   touchMachine(parsed.name); // idle-reaper activity signal
   const route = proxyRoute(card, parsed);
   proxyHttp({ req, res, port: route.port, target: route.target, name: parsed.name, frameAncestors: panelFrameAncestors(req), ...backendProxyOpts(card) });
@@ -2833,7 +2898,7 @@ const machineServer = http.createServer(async (req, res) => {
     // One-time SSO redeem → sets an embed cookie and redirects into the screen.
     if (req.method === 'GET' && rawPath === '/sso') return await handleSsoRedeem(req, res, (u) => { logUser = u; });
     if (rawPath.startsWith('/m/')) return await handleProxy(req, res, (u) => { logUser = u; });
-    return sendHtml(res, 404, errorPage(404, 'Not found', 'Machine screens are served here; open the panel to pick one.'));
+    return sendMachineHtml(req, res, 404, errorPage(404, 'Not found', 'Machine screens are served here; open the panel to pick one.', { back: false }));
   } catch (e) {
     if (!res.headersSent) sendText(res, 500, 'error');
   }
@@ -2922,6 +2987,7 @@ server.listen(config.port, config.bind, () => {
       console.log('  (send it as {"setupToken":"..."} with the setup request; it changes on every restart)');
     }
     reattachBrowserSessions().catch(() => {}); // re-adopt live browsers after a restart
+    setTimeout(() => { runBootRestore(); }, Number(process.env.VMP_BOOT_RESTORE_DELAY_MS ?? 10_000)).unref?.();
     try { sweepStale(os.tmpdir(), 'vmp-', 60 * 60 * 1000); } catch { /* best-effort */ } // clear crashed-upload scratch
   });
 });

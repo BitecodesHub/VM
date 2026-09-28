@@ -152,3 +152,24 @@ test('cookie: Secure attribute present only when secure:true; HttpOnly+SameSite 
     assert.match(h, new RegExp(`^${COOKIE_NAME}=`));
   }
 });
+
+test('machine-scoped embed cookie is path-scoped to that machine; refresh keeps the path', async () => {
+  let t = 1_000_000;
+  const { store } = tmpStore({ now: () => t, ttlMs: 10_000 });
+  const a = await store.create('dora', { embed: true, machine: 'desk-a' });
+  const b = await store.create('dora', { embed: true, machine: 'desk-b' });
+  assert.match(a.setCookie, /; Path=\/m\/desk-a\/;/);
+  assert.match(b.setCookie, /; Path=\/m\/desk-b\/;/);
+  assert.match(a.setCookie, /SameSite=None; Secure; Partitioned/);
+  // Two desktops no longer share one cookie slot: both still resolve.
+  assert.equal(store.resolve(a.setCookie.split(';')[0]).session.machine, 'desk-a');
+  assert.equal(store.resolve(b.setCookie.split(';')[0]).session.machine, 'desk-b');
+  // The sliding-TTL re-issue must carry the same path, or it would plant a
+  // Path=/ copy that shadows the other desktop's cookie again.
+  assert.match(store.setCookieHeader(a.sid), /; Path=\/m\/desk-a\/;/);
+  // Unscoped embed sessions and ordinary logins keep Path=/.
+  const plain = await store.create('dora', { embed: true });
+  assert.match(plain.setCookie, /; Path=\/;/);
+  const login = await store.create('dora');
+  assert.match(login.setCookie, /SameSite=Lax; Path=\//);
+});

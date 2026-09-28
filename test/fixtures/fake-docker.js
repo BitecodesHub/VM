@@ -44,7 +44,7 @@ function inspectObj(name, c) {
     Name: '/' + name,
     Config: { Image: c.image, Labels: c.labels || {} },
     State: { Status: c.state, StartedAt: c.startedAt || '2026-07-10T00:00:00Z', ExitCode: c.exitCode ?? 0, OOMKilled: !!c.oomKilled },
-    HostConfig: { PortBindings: pb, Memory: c.memoryBytes || 0 },
+    HostConfig: { PortBindings: pb, Memory: c.memoryBytes || 0, RestartPolicy: { Name: c.restart || 'on-failure', MaximumRetryCount: c.restart ? 0 : 3 } },
     NetworkSettings: { Ports: pb },
   };
 }

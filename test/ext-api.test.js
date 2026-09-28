@@ -169,6 +169,8 @@ test('ext: SSO mint → redeem sets an embed cookie once, then blocks replay', a
     assert.match(redeem.headers.get('location') || '', /^\/m\/shared-desk\//);
     assert.match(redeem.setCookie || '', /SameSite=None/i);
     assert.match(redeem.setCookie || '', /Partitioned/i);
+    // Path-scoped to that desktop, so a second desktop's cookie cannot replace it.
+    assert.match(redeem.setCookie || '', /Path=\/m\/shared-desk\//);
 
     // The minted session authenticates as the SSO user.
     const cookie = cookieFrom(redeem.setCookie);
@@ -184,3 +186,24 @@ test('ext: SSO mint → redeem sets an embed cookie once, then blocks replay', a
     assert.equal((await panel.req('POST', '/api/ext/sso/mint', { headers: AUTH, body: { username: 'ghost' } })).status, 404);
   });
 });
+
+test('ext: machine-origin error pages can be shown inside the PRISM frame', async () => {
+  const panel = await spawnPanel({ env: { VMP_PANEL_API_TOKEN: TOKEN }, config: { embedOrigins: ['https://prism.example.test'] } })
+  try {
+    await setupAdmin(panel)
+    for (const [p, headers, status] of [
+      ['/sso?t=not-a-token', {}, 401],
+      ['/m/some-desk/vnc.html', { Accept: 'text/html' }, 401],
+      ['/', {}, 404],
+    ]) {
+      const r = await panel.req('GET', p, { machine: true, headers })
+      assert.equal(r.status, status, p)
+      assert.equal(r.headers.get('x-frame-options'), null, `${p}: no X-Frame-Options`)
+      assert.match(r.headers.get('content-security-policy') || '', /frame-ancestors [^;]*https:\/\/prism\.example\.test/, `${p}: PRISM may frame it`)
+      assert.doesNotMatch(r.text, /Back to PRISM Virtual Desktop/, `${p}: no dead-end link inside the frame`)
+    }
+    // A signed-out screen navigation explains itself instead of redirecting to a 404.
+    const r = await panel.req('GET', '/m/some-desk/vnc.html', { machine: true, headers: { Accept: 'text/html' } })
+    assert.match(r.text, /Desktop session ended/)
+  } finally { panel.kill() }
+})
