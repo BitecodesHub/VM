@@ -3039,6 +3039,9 @@ async function handleProxy(req, res, setUser) {
 
   const parsed = parseProxyPath(req.url);
   if (!parsed) return sendMachineHtml(req, res, 404, errorPage(404, 'Not found', 'That machine path is not valid.', { back: false }));
+  // No service workers on the machine origin: the viewer uses none, and one
+  // registered by a hostile desktop would outlive the desktop in the browser.
+  if (String(req.headers['service-worker'] || '').toLowerCase() === 'script') return sendText(res, 403, 'Service workers are not allowed here.');
   // Machine-scoped embed session: only its own desktop. Same 404 as an unknown
   // machine, so the response is not an existence oracle for other machines.
   if (auth.session?.machine && auth.session.machine !== parsed.name) {

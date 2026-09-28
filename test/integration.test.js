@@ -796,3 +796,19 @@ test('proxy: a static file too big to tag is streamed whole, untagged', async ()
     });
   } finally { srv.close(); }
 });
+
+test('proxy: a service worker cannot be registered on the machine origin', async () => {
+  const backend = await startBackend();
+  try {
+    await withPanel({ world: seedMachine('alice', backend.port) }, async (panel) => {
+      const admin = await setupAdmin(panel);
+      await panel.req('POST', '/api/users', { cookie: admin, body: { username: 'alice', password: PW, role: 'user' } });
+      const alice = await activate(panel, 'alice', PW);
+      backend.state.lastHeaders = null;
+      const r = await panel.req('GET', '/m/desktop-1/sw.js', { cookie: alice, machine: true, headers: { 'Service-Worker': 'script' } });
+      assert.equal(r.status, 403);
+      assert.equal(backend.state.lastHeaders, null, 'never reached the desktop');
+      assert.equal((await panel.req('GET', '/m/desktop-1/main.bundle.js', { cookie: alice, machine: true })).status, 200, 'ordinary requests unaffected');
+    });
+  } finally { backend.close(); }
+});
