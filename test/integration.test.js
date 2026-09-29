@@ -812,3 +812,26 @@ test('proxy: a service worker cannot be registered on the machine origin', async
     });
   } finally { backend.close(); }
 });
+
+test('proxy: the desktop websocket is accepted from the dedicated screen host and the old :5443 origin, and refused from others', async () => {
+  const backend = await startBackend();
+  try {
+    await withPanel({ world: seedMachine('alice', backend.port), config: { publicTls: true, publicHost: 'vm.example.test', machineHttpsPort: 5443, panelHttpsPort: 443, machinePublicHost: 'desk.vm.example.test' } }, async (panel) => {
+      const admin = await setupAdmin(panel);
+      await panel.req('POST', '/api/users', { cookie: admin, body: { username: 'alice', password: PW, role: 'user' } });
+      const alice = await activate(panel, 'alice', PW);
+      const upgrade = (origin) => new Promise((resolve, reject) => {
+        const key = crypto.randomBytes(16).toString('base64');
+        const sock = net.connect(panel.machinePort, '127.0.0.1', () => {
+          sock.write(`GET /m/desktop-1/websockify HTTP/1.1\r\nHost: 127.0.0.1:${panel.machinePort}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ${key}\r\nSec-WebSocket-Version: 13\r\nOrigin: ${origin}\r\nCookie: ${alice}\r\n\r\n`);
+        });
+        let buf = ''; sock.on('data', (d) => { buf += d.toString(); if (buf.includes('\r\n\r\n')) { resolve(buf.split('\r\n')[0]); sock.destroy(); } });
+        sock.on('error', reject); setTimeout(() => reject(new Error('ws timeout: ' + buf)), 4000);
+      });
+      assert.match(await upgrade('https://desk.vm.example.test'), / 101 /, 'new screen host');
+      assert.match(await upgrade('https://vm.example.test:5443'), / 101 /, 'old :5443 origin still works for open viewers');
+      assert.match(await upgrade('https://evil.example'), / 403 /, 'anything else refused');
+      assert.match(await upgrade('https://vm.example.test'), / 403 /, 'the panel origin is not a screen origin');
+    });
+  } finally { backend.close(); }
+});

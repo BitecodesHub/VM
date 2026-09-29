@@ -220,7 +220,13 @@ function publicOrigins(port) {
   return out;
 }
 function isPanelPublicOrigin(origin) { return publicOrigins(config.panelHttpsPort).includes(origin); }
-function isMachinePublicOrigin(origin) { return publicOrigins(config.machineHttpsPort).includes(origin); }
+// The dedicated screen hostname (config.machinePublicHost), when configured.
+function machineHostOrigins() {
+  if (!config.publicTls || !config.machinePublicHost) return [];
+  const port = config.machinePublicPort || 443;
+  return port === 443 ? [`https://${config.machinePublicHost}`, `https://${config.machinePublicHost}:443`] : [`https://${config.machinePublicHost}:${port}`];
+}
+function isMachinePublicOrigin(origin) { return publicOrigins(config.machineHttpsPort).includes(origin) || machineHostOrigins().includes(origin); }
 
 // Does the docker daemon's host expose a v4l2loopback camera we can map into a
 // Media Desktop? Explicit config wins; otherwise auto-detect a /dev/video0 the
@@ -676,7 +682,7 @@ async function getState(user) {
       ? lastVmResult
       : { kind: lastVmResult.kind, ok: false, timedOut: lastVmResult.timedOut, at: lastVmResult.at };
   }
-  const panel = { port: config.port, machinePort, lanHost: config.lanHost || pickLanAddress(os.networkInterfaces()), tls: config.publicTls, publicHost: config.publicHost, panelHttpsPort: config.panelHttpsPort, machineHttpsPort: config.machineHttpsPort, hostWebcam, secureContext: !!config.publicTls, version: VERSION, build: BUILD.sha, buildSource: BUILD.source, branch: BUILD.branch || null };
+  const panel = { port: config.port, machinePort, lanHost: config.lanHost || pickLanAddress(os.networkInterfaces()), tls: config.publicTls, publicHost: config.publicHost, panelHttpsPort: config.panelHttpsPort, machineHttpsPort: config.machineHttpsPort, machineOrigin: machineHostOrigins()[0] || null, hostWebcam, secureContext: !!config.publicTls, version: VERSION, build: BUILD.sha, buildSource: BUILD.source, branch: BUILD.branch || null };
   const sharedNames = sharedSetFor(user);
 
   const wrap = (cards, stale, dockerReachable) => {
@@ -1832,6 +1838,7 @@ function panelCsp(req) {
     for (const h of publicHosts()) frames.push(`https://${h}:${config.machineHttpsPort}`);
     frames.push(`https://${hostname}:${config.machineHttpsPort}`);
   }
+  frames.push(...machineHostOrigins());
   return [
     "default-src 'self'",
     "script-src 'self'",
@@ -2255,7 +2262,9 @@ function originFor(req, tlsPort, plainPort) {
   }
   return `http://${hostOnly(req.headers.host)}:${plainPort}`;
 }
-const machineOriginFor = (req) => originFor(req, config.machineHttpsPort, machinePort);
+// The screen origin handed out (SSO links, the ext listing): the dedicated
+// hostname when configured, else <publicHost>:machineHttpsPort.
+const machineOriginFor = (req) => (machineHostOrigins()[0] || originFor(req, config.machineHttpsPort, machinePort));
 const panelOriginFor = (req) => originFor(req, config.panelHttpsPort, config.port);
 
 // A strong random password for ext-provisioned users. They never type it — they

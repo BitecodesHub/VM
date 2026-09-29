@@ -207,3 +207,35 @@ test('ext: machine-origin error pages can be shown inside the PRISM frame', asyn
     assert.match(r.text, /Desktop session ended/)
   } finally { panel.kill() }
 })
+
+test('ext: a dedicated screen hostname on 443 is the advertised origin; the :5443 origin stays accepted', async () => {
+  const panel = await spawnPanel({
+    env: { VMP_PANEL_API_TOKEN: TOKEN },
+    config: { publicTls: true, publicHost: 'vm.example.test', machineHttpsPort: 5443, panelHttpsPort: 8443, machinePublicHost: 'desk.vm.example.test' },
+  })
+  try {
+    const admin = await setupAdmin(panel)
+    const list = await panel.req('GET', '/api/ext/machines', { headers: AUTH })
+    assert.equal(list.json.machineOrigin, 'https://desk.vm.example.test', 'standard port, no :443')
+    await panel.req('POST', '/api/ext/users', { headers: AUTH, body: { username: 'contractor', role: 'user' } })
+    const mint = await panel.req('POST', '/api/ext/sso/mint', { headers: AUTH, body: { username: 'contractor' } })
+    assert.match(mint.json.url, /^https:\/\/desk\.vm\.example\.test\/sso\?t=/)
+    const st = await panel.req('GET', '/api/state', { cookie: admin })
+    assert.equal(st.json.panel.machineOrigin, 'https://desk.vm.example.test', 'the panel UI opens screens there too')
+    const page = await panel.req('GET', '/', { cookie: admin })
+    const csp = page.headers.get('content-security-policy') || ''
+    assert.match(csp, /frame-src[^;]*https:\/\/desk\.vm\.example\.test/, 'the panel may frame the new origin')
+    assert.match(csp, /frame-src[^;]*https:\/\/vm\.example\.test:5443/, 'and still the old one')
+  } finally { panel.kill() }
+})
+
+test('ext: an invalid screen hostname in config is ignored (falls back to <publicHost>:5443)', async () => {
+  const panel = await spawnPanel({
+    env: { VMP_PANEL_API_TOKEN: TOKEN },
+    config: { publicTls: true, publicHost: 'vm.example.test', machineHttpsPort: 5443, panelHttpsPort: 8443, machinePublicHost: 'bad host/../x' },
+  })
+  try {
+    await setupAdmin(panel)
+    assert.equal((await panel.req('GET', '/api/ext/machines', { headers: AUTH })).json.machineOrigin, 'https://vm.example.test:5443')
+  } finally { panel.kill() }
+})

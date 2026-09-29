@@ -53,6 +53,8 @@ function machineUrl(m) {
   // Behind the Caddy TLS front (page loaded over HTTPS), screens live on the
   // machine HTTPS port so mic/camera get a secure context; otherwise the plain
   // second origin (machinePort).
+  // A dedicated screen hostname on 443 (panel.machineOrigin) avoids networks that block :5443.
+  if (location.protocol === 'https:' && panel.machineOrigin) return `${panel.machineOrigin}${m.uiUrl}`;
   if (location.protocol === 'https:' && panel.machineHttpsPort) {
     return `https://${location.hostname}:${panel.machineHttpsPort}${m.uiUrl}`;
   }
