@@ -58,6 +58,19 @@ RUN apt-get update \
   && chmod +x /usr/local/bin/chromium \
   && sed -i -E 's#^Exec=/usr/bin/chromium#Exec=/usr/bin/chromium --no-sandbox --disable-gpu --password-store=basic#' /usr/share/applications/chromium.desktop
 
+# OneDrive (Microsoft 365) sync client: abraunegg/onedrive from the upstream-
+# recommended OpenSuSE Build Service repository (the Ubuntu universe package is
+# 2.4.x, which upstream calls outdated and buggy). Installed, not configured: a
+# user signs in with `onedrive` (device code at microsoft.com/devicelogin) and
+# syncs to ~/OneDrive; config and tokens live in ~/.config/onedrive, so they
+# survive archive + restore onto a newer image. There is no systemd in the
+# desktop, so the packaged user unit is dropped.
+RUN wget -qO - https://download.opensuse.org/repositories/home:/npreining:/debian-ubuntu-onedrive/xUbuntu_24.04/Release.key | gpg --dearmor > /usr/share/keyrings/obs-onedrive.gpg \
+  && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/obs-onedrive.gpg] https://download.opensuse.org/repositories/home:/npreining:/debian-ubuntu-onedrive/xUbuntu_24.04/ ./" > /etc/apt/sources.list.d/onedrive.list \
+  && apt-get update && apt-get install -y --no-install-recommends --no-install-suggests onedrive \
+  && rm -f /etc/systemd/user/default.target.wants/onedrive.service \
+  && rm -rf /var/lib/apt/lists/*
+
 # Rebrand the KasmVNC web client so it never shows "Kasm" to users: retitle,
 # replace the visible product name with PRISM, and blank the Kasm logo/favicon
 # assets. Only display strings + images are touched — internal identifiers and
