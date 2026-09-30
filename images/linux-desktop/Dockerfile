@@ -71,6 +71,19 @@ RUN wget -qO - https://download.opensuse.org/repositories/home:/npreining:/debia
   && rm -f /etc/systemd/user/default.target.wants/onedrive.service \
   && rm -rf /var/lib/apt/lists/*
 
+# Office: LibreOffice for local .docx/.xlsx/.pptx files (Microsoft has no Linux or
+# ARM desktop Office), and Microsoft 365 web apps (Teams, Word, Excel, PowerPoint,
+# Outlook) as app-mode Chromium launchers in the application menu. Teams calls work
+# with the microphone; there is no camera in these desktops.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libreoffice-writer libreoffice-calc libreoffice-impress libreoffice-gtk3 libreoffice-style-colibre \
+      fonts-crosextra-carlito fonts-crosextra-caladea \
+  && rm -rf /var/lib/apt/lists/* \
+  && for spec in "Teams|https://teams.microsoft.com|applications-internet" "Word|https://www.office.com/launch/word|x-office-document" "Excel|https://www.office.com/launch/excel|x-office-spreadsheet" "PowerPoint|https://www.office.com/launch/powerpoint|x-office-presentation" "Outlook|https://outlook.office.com/mail|mail-message"; do \
+       n="${spec%%|*}"; r="${spec#*|}"; u="${r%%|*}"; i="${r#*|}"; \
+       printf '[Desktop Entry]\nType=Application\nName=%s (web)\nComment=Microsoft 365 %s in its own window\nIcon=%s\nTerminal=false\nExec=/usr/local/bin/chromium --app=%s\nCategories=Office;Network;\n' "$n" "$n" "$i" "$u" > "/usr/share/applications/ms-$(echo $n | tr A-Z a-z).desktop"; \
+     done
+
 # Rebrand the KasmVNC web client so it never shows "Kasm" to users: retitle,
 # replace the visible product name with PRISM, and blank the Kasm logo/favicon
 # assets. Only display strings + images are touched — internal identifiers and
