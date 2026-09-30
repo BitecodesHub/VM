@@ -84,6 +84,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
        printf '[Desktop Entry]\nType=Application\nName=%s (web)\nComment=Microsoft 365 %s in its own window\nIcon=%s\nTerminal=false\nExec=/usr/local/bin/chromium --app=%s\nCategories=Office;Network;\n' "$n" "$n" "$i" "$u" > "/usr/share/applications/ms-$(echo $n | tr A-Z a-z).desktop"; \
      done
 
+# Native Teams (unofficial community client, Electron; needs --no-sandbox here) and
+# OnlyOffice Desktop Editors (native Word/Excel/PowerPoint-compatible editors,
+# arm64 .deb). Pinned versions; bump when rebuilding.
+RUN cd /tmp \
+  && curl -fsSL -o teams.deb https://github.com/IsmaelMartinez/teams-for-linux/releases/download/v2.22.0/teams-for-linux_2.22.0_arm64.deb \
+  && curl -fsSL -o oo.deb https://github.com/ONLYOFFICE/DesktopEditors/releases/download/v9.4.0/onlyoffice-desktopeditors_arm64.deb \
+  && apt-get update && apt-get install -y --no-install-recommends ./teams.deb ./oo.deb \
+  && rm -f teams.deb oo.deb && rm -rf /var/lib/apt/lists/* \
+  && sed -i -E 's#^Exec=(/opt/teams-for-linux/teams-for-linux)#Exec=\1 --no-sandbox#' /usr/share/applications/teams-for-linux.desktop
+
 # Rebrand the KasmVNC web client so it never shows "Kasm" to users: retitle,
 # replace the visible product name with PRISM, and blank the Kasm logo/favicon
 # assets. Only display strings + images are touched — internal identifiers and
