@@ -1577,7 +1577,13 @@ async function deleteMachineFile(user, name, filename) {
 // (data/browser-sessions.json) and re-attached on boot, so a panel restart no
 // longer orphans a live browser window.
 const browserSessions = new Map(); // name -> { sessionId, wdPort, timer, startedAt }
+const browserOpening = new Map(); // name -> in-flight open (Promise of the open result)
 const WD_START_PAGE = 'https://www.google.com';
+// A node that has just started needs a few seconds (about 5 s on the official
+// image) before Selenium accepts a session. Opening it in that window used to
+// fail, leaving the viewer on the bare Selenium wallpaper; now the open waits
+// for GET /status to report ready. Tests shorten the wait.
+const WD_READY_TIMEOUT_MS = Number(process.env.VMP_WD_READY_TIMEOUT_MS ?? 30_000);
 const BROWSER_SESSIONS_FILE = path.join(DATA_DIR, 'browser-sessions.json');
 
 async function wdFetch(port, method, p, body, timeoutMs = 30_000) {
@@ -1589,6 +1595,18 @@ async function wdFetch(port, method, p, body, timeoutMs = 30_000) {
   });
   const json = await res.json().catch(() => null);
   return { status: res.status, json };
+}
+
+async function waitForWebDriver(port) {
+  const deadline = Date.now() + WD_READY_TIMEOUT_MS;
+  for (;;) {
+    try {
+      const st = await wdFetch(port, 'GET', '/status', undefined, 3000);
+      if (st.status === 200 && st.json?.value?.ready === true) return true;
+    } catch { /* not listening yet */ }
+    if (Date.now() >= deadline) return false;
+    await new Promise((r) => setTimeout(r, 1000));
+  }
 }
 
 // Keep-alive pinger: resets Selenium's idle timer; drops the session on failure.
@@ -1659,7 +1677,21 @@ async function openBrowserSession(user, name) {
     dropBrowserSession(name);
   }
 
+  // One open at a time per node: concurrent opens (the SSO landing plus a menu
+  // click, or two tabs) share the first instead of queueing a second session
+  // behind the node's single Selenium slot.
+  const inflight = browserOpening.get(name);
+  if (inflight) return inflight;
+  const opening = createBrowserSession(name, card, t).finally(() => browserOpening.delete(name));
+  browserOpening.set(name, opening);
+  return opening;
+}
+
+async function createBrowserSession(name, card, t) {
   try {
+    if (!(await waitForWebDriver(card.webdriver.port))) {
+      return { status: 502, body: { error: { code: 'WEBDRIVER_UNREACHABLE', message: 'The browser engine did not answer. The node may still be starting.' } } };
+    }
     const created = await wdFetch(card.webdriver.port, 'POST', '/session', {
       capabilities: { alwaysMatch: { browserName: t.wdBrowserName } },
     });

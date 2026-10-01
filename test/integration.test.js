@@ -422,7 +422,8 @@ function seedChromeNode(owner, uiPort, wdPort) {
 }
 
 test('browser endpoint: authz, non-selenium 400, unreachable engine 502, idle close 200', async () => {
-  await withPanel({ world: seedChromeNode('alice', 41000, 41001) }, async (panel) => {
+  // A short readiness wait: nothing ever listens on the WebDriver port here.
+  await withPanel({ world: seedChromeNode('alice', 41000, 41001), env: { VMP_WD_READY_TIMEOUT_MS: '1500' } }, async (panel) => {
     const admin = await setupAdmin(panel);
     await panel.req('POST', '/api/users', { cookie: admin, body: { username: 'alice', password: PW, role: 'user' } });
     await panel.req('POST', '/api/users', { cookie: admin, body: { username: 'carol', password: PW, role: 'user' } });
@@ -448,6 +449,7 @@ test('browser endpoint: 400 on a non-selenium machine, works against a real fake
   const wd = http.createServer((req, res) => {
     calls.push(`${req.method} ${req.url}`);
     res.setHeader('Content-Type', 'application/json');
+    if (req.method === 'GET' && req.url === '/status') return res.end(JSON.stringify({ value: { ready: true } }));
     if (req.method === 'POST' && req.url === '/session') { req.resume(); return req.on('end', () => res.end(JSON.stringify({ value: { sessionId: 'sess-1', capabilities: {} } }))); }
     if (req.method === 'POST' && /\/session\/sess-1\/window\/maximize$/.test(req.url)) { req.resume(); return req.on('end', () => res.end(JSON.stringify({ value: { x: 0, y: 0, width: 1920, height: 1080 } }))); }
     if (req.method === 'POST' && /\/session\/sess-1\/url$/.test(req.url)) { req.resume(); return req.on('end', () => res.end(JSON.stringify({ value: null }))); }
@@ -494,6 +496,41 @@ test('browser endpoint: 400 on a non-selenium machine, works against a real fake
       assert.equal((await panel.req('DELETE', '/api/machines/chrome-node-1/browser', { cookie: alice })).status, 200);
       const st2 = await panel.req('GET', '/api/state', { cookie: alice });
       assert.ok(!st2.json.machines.find((m) => m.name === 'chrome-node-1').browserActive, 'decoration cleared after close');
+    });
+  } finally { wd.close(); }
+});
+
+test('browser endpoint: waits for a node that is still starting; concurrent opens share one session', async () => {
+  // Selenium reports not-ready for its first status polls (a node that has just
+  // started), then ready. Session creation is slow, so two opens overlap.
+  let statusPolls = 0;
+  const calls = [];
+  const wd = http.createServer((req, res) => {
+    calls.push(`${req.method} ${req.url}`);
+    res.setHeader('Content-Type', 'application/json');
+    if (req.method === 'GET' && req.url === '/status') { statusPolls++; return res.end(JSON.stringify({ value: { ready: statusPolls > 2 } })); }
+    if (req.method === 'POST' && req.url === '/session') { req.resume(); return req.on('end', () => setTimeout(() => res.end(JSON.stringify({ value: { sessionId: 'sess-2', capabilities: {} } })), 300)); }
+    if (req.method === 'POST' && /\/session\/sess-2\/(window\/maximize|url)$/.test(req.url)) { req.resume(); return req.on('end', () => res.end(JSON.stringify({ value: null }))); }
+    if (req.method === 'GET' && /\/session\/sess-2\/url$/.test(req.url)) return res.end(JSON.stringify({ value: 'about:blank' }));
+    if (req.method === 'DELETE') return res.end(JSON.stringify({ value: null }));
+    res.statusCode = 404; res.end(JSON.stringify({ value: { message: 'unknown' } }));
+  });
+  await new Promise((r) => wd.listen(0, '127.0.0.1', r));
+  try {
+    await withPanel({ world: seedChromeNode('alice', 43000, wd.address().port) }, async (panel) => {
+      const admin = await setupAdmin(panel);
+      await panel.req('POST', '/api/users', { cookie: admin, body: { username: 'alice', password: PW, role: 'user' } });
+      const alice = await activate(panel, 'alice', PW);
+      const [a, b] = await Promise.all([
+        panel.req('POST', '/api/machines/chrome-node-1/browser', { cookie: alice }),
+        panel.req('POST', '/api/machines/chrome-node-1/browser', { cookie: alice }),
+      ]);
+      assert.equal(a.status, 200, JSON.stringify(a.json));
+      assert.equal(b.status, 200, JSON.stringify(b.json));
+      assert.equal(a.json.sessionId, 'sess-2');
+      assert.equal(b.json.sessionId, 'sess-2');
+      assert.ok(statusPolls >= 3, 'waited for Selenium to report ready');
+      assert.equal(calls.filter((c) => c === 'POST /session').length, 1, 'one session for two overlapping opens');
     });
   } finally { wd.close(); }
 });
