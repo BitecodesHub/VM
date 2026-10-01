@@ -415,7 +415,7 @@ test('hardening: malformed %-encoding → 400, oversized body → 413', async ()
 // ---- Live browser endpoint (Selenium nodes) ---------------------------------
 function seedChromeNode(owner, uiPort, wdPort) {
   return { nextId: 2, containers: { 'chrome-node-1': {
-    id: 'fake000000009', image: 'local-seleniarm/standalone-chromium:4.5.0-20260701',
+    id: 'fake000000009', image: 'local-selenium/standalone-chromium:4.49.0-20260909',
     labels: { 'vmpanel.managed': '1', 'vmpanel.template': 'chrome-node', 'vmpanel.owner': owner, 'vmpanel.ui.port': String(uiPort), 'vmpanel.ui.path': '/vnc.html', 'vmpanel.webdriver.port': String(wdPort) },
     ports: { '7900': String(uiPort), '4444': String(wdPort) }, state: 'running', exitCode: 0, startedAt: '2026-07-10T00:00:00Z',
   } } };

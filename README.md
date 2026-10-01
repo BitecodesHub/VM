@@ -73,8 +73,8 @@ against an idle device.)
 |----------|-------|-----------|---------|
 | Linux Desktop — XFCE *(recommended)* | `minimal-linux-desktop:xfce` | 2 GiB | 2 |
 | Linux Desktop — IceWM (lightweight) | `minimal-linux-desktop:icewm` | 1.5 GiB | 2 |
-| Chrome Node (Selenium) | `local-seleniarm/standalone-chromium` | 2 GiB | 2 |
-| Firefox Node (Selenium) | `local-seleniarm/standalone-firefox` | 2 GiB | 2 |
+| Chrome Node (Selenium) | `local-selenium/standalone-chromium` (official image, Chromium 152) | 2 GiB | 2 |
+| Firefox Node (Selenium) *(withdrawn: no new nodes)* | `local-seleniarm/standalone-firefox` | 2 GiB | 2 |
 
 Caps are applied **by default** (`capResources: true`). This matters because the
 VM runs with **no swap**: an uncapped desktop that balloons drives the whole VM

@@ -88,7 +88,7 @@ test('ext: resource defaults, create with explicit or default limits, live edit,
     assert.ok(st.json.readOnly.resourceBounds.max.memoryMiB >= 1024);
 
     // Change the XFCE default; bad input is refused and nothing is saved.
-    assert.equal((await panel.req('PATCH', '/api/ext/settings', { headers: AUTH, body: { resourceDefaults: { 'chrome-node': { cpus: 1, memoryMiB: 2048 } } } })).status, 400, 'withdrawn template');
+    assert.equal((await panel.req('PATCH', '/api/ext/settings', { headers: AUTH, body: { resourceDefaults: { 'firefox-node': { cpus: 1, memoryMiB: 2048 } } } })).status, 400, 'withdrawn template');
     assert.equal((await panel.req('PATCH', '/api/ext/settings', { headers: AUTH, body: { resourceDefaults: { 'linux-desktop': { cpus: 1, memoryMiB: 1000 } } } })).status, 400, 'off-step memory');
     st = await panel.req('PATCH', '/api/ext/settings', { headers: AUTH, body: { resourceDefaults: { 'linux-desktop': { cpus: 1, memoryMiB: 1536 } } } });
     assert.equal(st.status, 200, JSON.stringify(st.json));

@@ -132,7 +132,7 @@ test('mapContainerToCard: managed chrome-node — template ui beats stale label,
   const insp = {
     Name: '/chrome-node-1',
     Config: {
-      Image: 'local-seleniarm/standalone-chromium:4.5.0-20260701',
+      Image: 'local-selenium/standalone-chromium:4.49.0-20260909',
       Labels: {
         'vmpanel.managed': '1', 'vmpanel.template': 'chrome-node', 'vmpanel.owner': 'bob',
         // Old-style label from a container created before the autoconnect change —
@@ -248,7 +248,7 @@ test('buildRunArgs writes owner label, loopback ui, configurable webdriver bind'
   assert.ok(args.includes('vmpanel.owner=alice'));
   assert.ok(args.includes('127.0.0.1:7901:7900'));
   assert.ok(args.includes('0.0.0.0:4445:4444'));
-  assert.equal(args[args.length - 1], 'local-seleniarm/standalone-chromium:4.5.0-20260701');
+  assert.equal(args[args.length - 1], 'local-selenium/standalone-chromium:4.49.0-20260909');
 });
 
 test('buildRunArgs defaults webdriver to loopback and requires owner', () => {

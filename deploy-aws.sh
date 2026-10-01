@@ -56,12 +56,14 @@ docker build -t minimal-linux-desktop:xfce   "$APP_DIR/images/linux-desktop" \
   || { echo "FATAL: xfce desktop image build failed — aborting deploy (desktops would be unopenable)." >&2; exit 1; }
 docker build -t minimal-linux-desktop:icewm  "$APP_DIR/images/icewm-desktop" \
   || { echo "FATAL: icewm desktop image build failed — aborting deploy (desktops would be unopenable)." >&2; exit 1; }
-# Selenium node images: pull the public multi-arch seleniarm images, then build
-# the kiosk overlay (undecorated, unminimizable, maximized browser windows) and
-# tag it to the local names the templates reference, so Chrome/Firefox nodes
-# never try to pull a non-existent repo (that was the "VM not creating" 500).
-docker pull seleniarm/standalone-chromium:latest && docker build -t local-seleniarm/standalone-chromium:4.5.0-20260701 --build-arg BASE=seleniarm/standalone-chromium:latest "$APP_DIR/images/browser-node" || echo "  WARN: chromium node image unavailable"
-docker pull seleniarm/standalone-firefox:latest  && docker build -t local-seleniarm/standalone-firefox:4.5.0-20260701  --build-arg BASE=seleniarm/standalone-firefox:latest  "$APP_DIR/images/browser-node" || echo "  WARN: firefox node image unavailable"
+# Chrome node image: pull the official multi-arch Selenium image (pinned to a
+# dated tag), then build the kiosk overlay (undecorated, unminimizable,
+# maximized browser windows) and tag it to the local name the template
+# references, so Chrome nodes never try to pull a non-existent repo (that was
+# the "VM not creating" 500). The Firefox node template is withdrawn, so its
+# old seleniarm image is no longer built.
+CHROME_NODE_BASE=selenium/standalone-chromium:4.49.0-20260909
+docker pull "$CHROME_NODE_BASE" && docker build -t local-selenium/standalone-chromium:4.49.0-20260909 --build-arg BASE="$CHROME_NODE_BASE" "$APP_DIR/images/browser-node" || echo "  WARN: chrome node image unavailable"
 
 echo "[5/7] Panel runtime config…"
 mkdir -p "$APP_DIR/data"

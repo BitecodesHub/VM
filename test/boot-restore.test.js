@@ -84,6 +84,8 @@ test('boot restore (integration): after a reboot the panel restarts the desktops
     assert.equal(world.containers['was-on'].state, 'running', 'restored');
     assert.equal(world.containers['was-off'].state, 'exited', 'was not running before the reboot');
     assert.equal(world.containers['legacy-on'].state, 'exited', 'left to its own Docker restart policy');
+    // The fake docker writes the world before the panel logs the result: wait for the line.
+    for (let i = 0; i < 50 && !/\[VMP_BOOT_RESTORE\] start was-on: ok/.test(panel.stdout()); i++) await new Promise((r) => setTimeout(r, 100));
     assert.match(panel.stdout(), /\[VMP_BOOT_RESTORE\] start was-on: ok/);
   } finally { panel.kill(); }
 });

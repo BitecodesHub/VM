@@ -13,7 +13,7 @@ all under permissive/open-source licences and redistributable:
 - **x11vnc**, **Xvfb**, **noVNC / websockify** — GPLv2 / MPL / permissive.
 
 ## Browser test nodes
-- **Selenium** standalone Chromium / Firefox images (`local-seleniarm/*`) — Apache-2.0
+- **Selenium** standalone Chromium image (`local-selenium/standalone-chromium`, built on the official `selenium/standalone-chromium`) and the withdrawn Firefox image (`local-seleniarm/standalone-firefox`) — Apache-2.0
   (Selenium) plus the browsers' own licences. Chromium is the open-source project,
   not Google Chrome branding.
 

@@ -39,13 +39,14 @@ test('zone.tab parsing: UTC first, sorted, unique, comments skipped', () => {
   assert.deepEqual(zones, ['UTC', 'Asia/Kolkata', 'Asia/Manila', 'Australia/Sydney']);
 });
 
-test('only the KasmVNC desktops take a time zone; browser-node templates are withdrawn', () => {
+test('only the KasmVNC desktops take a time zone; only the Firefox node is withdrawn', () => {
   assert.equal(supportsDesktopTimezone('linux-desktop'), true);
   assert.equal(supportsDesktopTimezone('icewm-desktop'), true);
   assert.equal(supportsDesktopTimezone('chrome-node'), false);
   assert.equal(supportsDesktopTimezone('nope'), false);
-  assert.deepEqual(availableTemplates().map((t) => t.id).sort(), ['icewm-desktop', 'linux-desktop']);
-  assert.ok(listTemplates().find((t) => t.id === 'chrome-node').withdrawn, 'still listed, flagged');
+  assert.deepEqual(availableTemplates().map((t) => t.id).sort(), ['chrome-node', 'icewm-desktop', 'linux-desktop']);
+  assert.ok(listTemplates().find((t) => t.id === 'firefox-node').withdrawn, 'still listed, flagged');
+  assert.equal(listTemplates().find((t) => t.id === 'chrome-node').withdrawn, undefined, 'Chrome node is back, on the official image');
 });
 
 test('hook under set -e: a missing, empty or hostile file never stops the session', { skip: !HAS_ZONEINFO && 'no zoneinfo' }, () => {
@@ -108,16 +109,17 @@ test('read script: reports the saved zone (and no active one off Linux)', { skip
 });
 
 test('ext: desktop time zone read, set (restarts), pending, refusals, withdrawn templates', async () => {
-  const node = { id: 'n1', image: 'local-seleniarm/standalone-chromium:4.5.0-20260701', state: 'running', labels: { 'vmpanel.managed': '1', 'vmpanel.template': 'chrome-node', 'vmpanel.owner': 'admin', 'vmpanel.ui.port': '7901' } };
+  const node = { id: 'n1', image: 'local-selenium/standalone-chromium:4.49.0-20260909', state: 'running', labels: { 'vmpanel.managed': '1', 'vmpanel.template': 'chrome-node', 'vmpanel.owner': 'admin', 'vmpanel.ui.port': '7901' } };
   const panel = await spawnPanel({ env: { VMP_PANEL_API_TOKEN: TOKEN }, world: { nextId: 5, containers: { 'chrome-node-1': node } } });
   try {
     const admin = await setupAdmin(panel);
-    // No new browser nodes; the listing PRISM shows leaves them out.
-    const refused = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'chrome-node', name: 'cn-2' } });
+    // No new Firefox nodes; the listing PRISM shows leaves them out. Chrome nodes are offered again.
+    const refused = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'firefox-node', name: 'fn-2' } });
     assert.equal(refused.status, 400);
     assert.equal(refused.json.error.code, 'TEMPLATE_WITHDRAWN');
     const tpl = await panel.req('GET', '/api/ext/templates', { headers: AUTH });
-    assert.deepEqual(tpl.json.templates.map((t) => t.id).sort(), ['icewm-desktop', 'linux-desktop']);
+    assert.deepEqual(tpl.json.templates.map((t) => t.id).sort(), ['chrome-node', 'icewm-desktop', 'linux-desktop']);
+    assert.deepEqual(tpl.json.templates.find((t) => t.id === 'chrome-node').defaults, { cpus: 2, memoryMiB: 2048 });
 
     const made = await panel.req('POST', '/api/machines', { cookie: admin, body: { template: 'linux-desktop', name: 'tz-desk' } });
     assert.equal(made.status, 202);
@@ -202,23 +204,23 @@ test('panel stop parks the restart policy at no; start puts on-failure back', as
 });
 
 test('withdrawn templates: no kept copy on delete, and an old copy is refused before any job starts', async () => {
-  const node = { id: 'n1', image: 'local-seleniarm/standalone-chromium:4.5.0-20260701', state: 'running', labels: { 'vmpanel.managed': '1', 'vmpanel.template': 'chrome-node', 'vmpanel.owner': 'admin', 'vmpanel.ui.port': '7901' } };
+  const node = { id: 'n1', image: 'local-seleniarm/standalone-firefox:4.5.0-20260701', state: 'running', labels: { 'vmpanel.managed': '1', 'vmpanel.template': 'firefox-node', 'vmpanel.owner': 'admin', 'vmpanel.ui.port': '7901' } };
   const id = '0123456789abcdef';
   const future = new Date(Date.now() + 5 * 86_400_000).toISOString();
   const panel = await spawnPanel({
     env: { VMP_PANEL_API_TOKEN: TOKEN },
-    world: { nextId: 5, containers: { 'chrome-node-1': node } },
+    world: { nextId: 5, containers: { 'firefox-node-1': node } },
     files: {
-      'archives/index.json': { version: 1, archives: { [id]: { id, machine: 'old-node', template: 'chrome-node', owner: 'admin', sharedWith: [], homeDir: '/home/seluser', bytes: 10, deletedAt: new Date().toISOString(), expiresAt: future } } },
+      'archives/index.json': { version: 1, archives: { [id]: { id, machine: 'old-node', template: 'firefox-node', owner: 'admin', sharedWith: [], homeDir: '/home/seluser', bytes: 10, deletedAt: new Date().toISOString(), expiresAt: future } } },
       [`archives/${id}.tar.gz`]: 'x',
     },
   });
   try {
     await setupAdmin(panel);
-    const del = await panel.req('DELETE', '/api/ext/machines/chrome-node-1', { headers: AUTH, body: { confirm: 'chrome-node-1', archive: true } });
+    const del = await panel.req('DELETE', '/api/ext/machines/firefox-node-1', { headers: AUTH, body: { confirm: 'firefox-node-1', archive: true } });
     assert.equal(del.status, 400);
     assert.equal(del.json.error.code, 'ARCHIVE_UNSUPPORTED');
-    assert.equal(panel.readWorld().containers['chrome-node-1'].state, 'running', 'nothing stopped');
+    assert.equal(panel.readWorld().containers['firefox-node-1'].state, 'running', 'nothing stopped');
     const restore = await panel.req('POST', `/api/ext/archives/${id}/restore`, { headers: AUTH, body: {} });
     assert.equal(restore.status, 409);
     assert.equal(restore.json.error.code, 'ARCHIVE_TEMPLATE_WITHDRAWN');

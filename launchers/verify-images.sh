@@ -41,7 +41,7 @@ while IFS=$'\t' read -r id image port scheme; do
   fi
   # ExposedPorts is only AUTHORITATIVE for images we build ourselves, because our
   # Dockerfiles declare EXPOSE. Docker happily publishes a port that was never
-  # EXPOSEd, so a third-party image (the pulled seleniarm nodes serve noVNC on
+  # EXPOSEd, so a third-party image (the Selenium browser nodes serve noVNC on
   # 7900 without declaring it) must not be failed on metadata alone — that would
   # be a false alarm, and a checker that cries wolf gets ignored.
   ctx=""
