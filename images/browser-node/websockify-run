@@ -1,0 +1,9 @@
+#!/usr/bin/env sh
+# PRISM overlay: replaces /opt/bin/noVNC/utils/websockify/run (novnc_proxy calls it).
+# Same as upstream, except websockify starts with the "fork" multiprocessing start
+# method. Python 3.14 made "forkserver" the Linux default, and websockify starts one
+# process per connection: with forkserver each costs ~145 ms, and the noVNC page
+# loads ~85 files, so the node's viewer took ~10 s to open. With fork it is ~10 ms.
+set -e
+cd "$(dirname "$0")"
+exec python3 -c 'import multiprocessing, runpy; multiprocessing.set_start_method("fork"); runpy.run_module("websockify", run_name="__main__", alter_sys=True)' "$@"
