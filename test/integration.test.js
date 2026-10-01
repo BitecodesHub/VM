@@ -443,10 +443,13 @@ test('browser endpoint: authz, non-selenium 400, unreachable engine 502, idle cl
 });
 
 test('browser endpoint: 400 on a non-selenium machine, works against a real fake engine', async () => {
-  // A tiny WebDriver stub: POST /session → sessionId; GET url → 200; DELETE → 200.
+  // A tiny WebDriver stub: POST /session → sessionId; GET url → 200; maximize → 200; DELETE → 200.
+  const calls = [];
   const wd = http.createServer((req, res) => {
+    calls.push(`${req.method} ${req.url}`);
     res.setHeader('Content-Type', 'application/json');
     if (req.method === 'POST' && req.url === '/session') { req.resume(); return req.on('end', () => res.end(JSON.stringify({ value: { sessionId: 'sess-1', capabilities: {} } }))); }
+    if (req.method === 'POST' && /\/session\/sess-1\/window\/maximize$/.test(req.url)) { req.resume(); return req.on('end', () => res.end(JSON.stringify({ value: { x: 0, y: 0, width: 1920, height: 1080 } }))); }
     if (req.method === 'POST' && /\/session\/sess-1\/url$/.test(req.url)) { req.resume(); return req.on('end', () => res.end(JSON.stringify({ value: null }))); }
     if (req.method === 'GET' && /\/session\/sess-1\/url$/.test(req.url)) return res.end(JSON.stringify({ value: 'about:blank' }));
     if (req.method === 'DELETE') return res.end(JSON.stringify({ value: null }));
@@ -472,11 +475,15 @@ test('browser endpoint: 400 on a non-selenium machine, works against a real fake
       const open = await panel.req('POST', '/api/machines/chrome-node-1/browser', { cookie: alice });
       assert.equal(open.status, 200, 'session created against the stub engine');
       assert.equal(open.json.sessionId, 'sess-1');
+      // Full screen by Maximize Window, never a fixed rect (Chromium 152 drops it: half-screen browser).
+      assert.equal(calls.filter((c) => c === 'POST /session/sess-1/window/maximize').length, 1, 'maximized on open');
+      assert.ok(!calls.some((c) => c.includes('/window/rect')), 'no fixed window rect');
 
       // Idempotent: second open reuses the live session.
       const again = await panel.req('POST', '/api/machines/chrome-node-1/browser', { cookie: alice });
       assert.equal(again.status, 200);
       assert.equal(again.json.reused, true, 'existing live session reused');
+      assert.equal(calls.filter((c) => c === 'POST /session/sess-1/window/maximize').length, 2, 'maximized again on reopen (restores a minimized window)');
 
       // Card decoration reflects the live session.
       const st = await panel.req('GET', '/api/state', { cookie: alice });

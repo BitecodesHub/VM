@@ -1649,10 +1649,10 @@ async function openBrowserSession(user, name) {
     try {
       const r = await wdFetch(existing.wdPort, 'GET', `/session/${existing.sessionId}/url`, undefined, 5000);
       if (r.status === 200) {
-        // Re-assert the full-screen rect on every reopen: per W3C, Set Window
-        // Rect first RESTORES the window, so a browser minimized by a script
-        // un-minimizes instead of leaving the viewer on the bare desktop.
-        await wdFetch(existing.wdPort, 'POST', `/session/${existing.sessionId}/window/rect`, { x: 0, y: 0, width: 1920, height: 1080 }, 10_000).catch(() => {});
+        // Re-assert full screen on every reopen: per W3C, Maximize Window first
+        // RESTORES the window, so a browser minimized (or resized) by a script
+        // comes back instead of leaving the viewer on the bare desktop.
+        await wdFetch(existing.wdPort, 'POST', `/session/${existing.sessionId}/window/maximize`, {}, 10_000).catch(() => {});
         return { status: 200, body: { ok: true, sessionId: existing.sessionId, reused: true } };
       }
     } catch { /* fall through and recreate */ }
@@ -1668,9 +1668,12 @@ async function openBrowserSession(user, name) {
       const msg = created.json?.value?.message || `WebDriver answered ${created.status}`;
       return { status: 502, body: { error: { code: 'WEBDRIVER_ERROR', message: String(msg).slice(0, 200) } } };
     }
-    // Fill the node's 1920x1080 screen — the browser opens small by default.
-    // W3C window/rect works for both Chrome and Firefox (unlike --start-maximized).
-    await wdFetch(card.webdriver.port, 'POST', `/session/${sessionId}/window/rect`, { x: 0, y: 0, width: 1920, height: 1080 }, 10_000).catch(() => {});
+    // Fill the node's screen. The image's fluxbox rules already maximize every
+    // window; W3C Maximize Window (Chrome and Firefox alike, unlike
+    // --start-maximized) makes sure. Do NOT set a 1920x1080 rect here: on
+    // Chromium 152 that un-maximizes the window and the new bounds are lost,
+    // leaving the browser on half the screen.
+    await wdFetch(card.webdriver.port, 'POST', `/session/${sessionId}/window/maximize`, {}, 10_000).catch(() => {});
     // Show something useful immediately (best effort — the window exists regardless).
     await wdFetch(card.webdriver.port, 'POST', `/session/${sessionId}/url`, { url: WD_START_PAGE }, 20_000).catch(() => {});
 
