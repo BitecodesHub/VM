@@ -35,7 +35,8 @@ RUN cp /etc/X11/fluxbox/init /home/seluser/.fluxbox/init \
 
 # websockify (serves the noVNC page and the screen socket) with the fork start
 # method: see websockify-run. ~10x faster page loads than Python 3.14's default.
-COPY --chmod=755 websockify-run /opt/bin/noVNC/utils/websockify/run
+COPY websockify-run /opt/bin/noVNC/utils/websockify/run
+RUN chmod 755 /opt/bin/noVNC/utils/websockify/run
 
 LABEL vmpanel.image="browser-node-kiosk"
 
