@@ -13,8 +13,9 @@
 #     the keyboard. Replaced with an empty set — a kiosk node needs no WM
 #     shortcuts at all.
 #   - fluxbox `init`: the image's defaults with the toolbar hidden.
-# It also starts websockify with the fork start method (websockify-run), which
-# opens the node's viewer in a fraction of the time.
+# It also starts websockify with the fork start method (websockify-run) and
+# preloads noVNC's files (novnc-preload.py), which open the node's viewer in a
+# fraction of the time.
 # fluxbox copies only the files that are missing into ~/.fluxbox on its first
 # start, so these survive and the rest come from /etc/X11/fluxbox.
 # The panel additionally maximizes the window on every open (server.js
@@ -37,6 +38,10 @@ RUN cp /etc/X11/fluxbox/init /home/seluser/.fluxbox/init \
 # method: see websockify-run. ~10x faster page loads than Python 3.14's default.
 COPY websockify-run /opt/bin/noVNC/utils/websockify/run
 RUN chmod 755 /opt/bin/noVNC/utils/websockify/run
+# Preload noVNC's whole module graph and its settings files from vnc.html, so
+# the page loads in one round trip instead of a chain of eight (novnc-preload.py).
+COPY novnc-preload.py /tmp/novnc-preload.py
+RUN python3 /tmp/novnc-preload.py /opt/bin/noVNC && rm /tmp/novnc-preload.py
 
 LABEL vmpanel.image="browser-node-kiosk"
 
